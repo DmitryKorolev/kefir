@@ -3,10 +3,25 @@
 **K**ernel **E**nforcing **F**ormal **I**nference **R**ules — an independent
 external proof checker for Lean 4.
 
-kefir re-checks Lean developments without trusting Lean's own kernel. It reads
-declarations exported by [lean4export](https://github.com/leanprover/lean4export)
-and checks every type and proof itself, including the inductive types and
-recursors, which it re-derives rather than taking from the export.
+kefir checks Lean developments without trusting Lean's own kernel, and aims to do
+it with as little memory and as few instructions as possible.
+
+![Mathlib: peak memory against instructions for every checker on the Lean Kernel Arena](images/kefir-pareto-mathlib-public-20261024.png)
+
+On the [Lean Kernel Arena](https://arena.lean-lang.org) snapshot of 2026-10-24
+(arena `87190f9c`, kefir `e05e1b0`), kefir has the lowest peak memory of any checker
+on all seven library inputs, and is on the memory–instruction Pareto frontier for
+each of them. It is not the fastest: on Mathlib, sokonanoda and mathgraph execute
+about 5.5× and 3.5× fewer instructions, with 3.1× and 2.7× kefir's peak memory.
+
+![Memory–instruction Pareto frontiers for all seven library inputs](images/kefir-pareto-all-inputs-public-20261024.png)
+
+## What kefir checks
+
+kefir reads declarations exported by
+[lean4export](https://github.com/leanprover/lean4export) and checks every type and
+proof itself, including the inductive types and recursors, which it re-derives rather
+than taking from the export.
 
 Each run ends in one of three verdicts:
 
@@ -15,9 +30,6 @@ Each run ends in one of three verdicts:
 - **reject**: a declaration is wrong;
 - **decline**: kefir hit something it doesn't support yet or ran out of its
   resource budget. A decline never claims anything about the proof.
-
-kefir aims to be fast and lean: our goal is to stay on the Pareto frontier of
-instructions and peak memory among Lean checkers, on inputs up to Mathlib.
 
 ## Build and run
 
@@ -50,8 +62,8 @@ declines; it never produces a verdict.
   gives up an attempt before the end of the reservation.
 - **Storage:** up to 16 GiB of managed live storage, plus fixed limits on input size,
   record size, nesting depth and charged work.
-- **Measured peak memory** on the Lean Kernel Arena libraries: about 2.5 GB on Mathlib,
-  at most about 1.1 GB on the others.
+- **Measured peak memory** on the Lean Kernel Arena libraries: 2.43 GiB on Mathlib,
+  at most 1.05 GiB on the others.
 
 Overflow checks stay enabled in release builds.
 
