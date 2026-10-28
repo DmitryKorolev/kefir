@@ -34,6 +34,93 @@ fn ordered_names(
     Ok(true)
 }
 
+/// Named view of one generated `DECLARATIONS` row. Sequence fields name
+/// `SEQUENCES` rows; `schema.rs` checks every field's range at compile time.
+#[derive(Clone, Copy)]
+struct Declaration {
+    name: u32,
+    kind: u32,
+    parameters: u32,
+    ty: u32,
+    /// Zero for every group member: families, constructors and recursors have
+    /// no value.
+    value: u32,
+    /// Family and recursor `all`; empty for a constructor.
+    all: u32,
+    /// Family constructor names; empty otherwise.
+    constructors: u32,
+    /// Recursor rules as `[constructor, fields, rhs]` triples; empty otherwise.
+    rules: u32,
+    /// `[key, value]` pairs in generated order; keys are in [`key`].
+    metadata: u32,
+    /// Constructor's inductive name; zero otherwise.
+    inductive: u32,
+    dependencies: u32,
+    group: u32,
+}
+impl From<&[u32; 12]> for Declaration {
+    fn from(row: &[u32; 12]) -> Self {
+        let [
+            name,
+            kind,
+            parameters,
+            ty,
+            value,
+            all,
+            constructors,
+            rules,
+            metadata,
+            inductive,
+            dependencies,
+            group,
+        ] = *row;
+        Self {
+            name,
+            kind,
+            parameters,
+            ty,
+            value,
+            all,
+            constructors,
+            rules,
+            metadata,
+            inductive,
+            dependencies,
+            group,
+        }
+    }
+}
+
+/// Metadata keys shared by every declaration kind in the manifest.
+mod key {
+    pub(super) const UNSAFE: u32 = 1;
+    pub(super) const RECURSIVE: u32 = 2;
+    pub(super) const REFLEXIVE: u32 = 3;
+    pub(super) const K: u32 = 4;
+    pub(super) const PARAMETERS: u32 = 5;
+    pub(super) const INDICES: u32 = 6;
+    pub(super) const NESTED: u32 = 7;
+    pub(super) const FIELDS: u32 = 8;
+    pub(super) const CONSTRUCTOR_INDEX: u32 = 9;
+    pub(super) const MOTIVES: u32 = 10;
+    pub(super) const MINORS: u32 = 11;
+}
+
+/// Exactly these pairs, in this order.
+fn metadata(sequence: u32, expected: &[(u32, u32)]) -> Result<bool, ResourceError> {
+    let (pairs, rest) = matching::sequence(sequence)?.as_chunks::<2>();
+    Ok(rest.is_empty()
+        && pairs.len() == expected.len()
+        && pairs
+            .iter()
+            .zip(expected)
+            .all(|(&[k, v], &(ek, ev))| k == ek && v == ev))
+}
+
+fn empty(sequence: u32) -> Result<bool, ResourceError> {
+    Ok(matching::sequence(sequence)?.is_empty())
+}
+
 #[derive(Clone, Copy)]
 enum Member<'a> {
     Family(&'a Inductive),
@@ -79,101 +166,88 @@ impl Member<'_> {
     #[allow(clippy::too_many_arguments)]
     fn matches(
         self,
-        row: &[u32; 12],
+        row: Declaration,
         request: &Group<'_>,
         n: &Names,
         l: &Levels,
         e: &Expressions,
         b: &mut Budget,
     ) -> Result<bool, ResourceError> {
-        if row[1] != self.kind() || row[4] != 0 {
+        if row.kind != self.kind() || row.value != 0 {
             return Err(ResourceError::Invariant);
         }
-        if !names(row[2], list(request.names, self.parameters())?, n, b)?
-            || !matching::expression(row[3], self.ty(), e, l, n, b)?
+        if !names(
+            row.parameters,
+            list(request.names, self.parameters())?,
+            n,
+            b,
+        )? || !matching::expression(row.ty, self.ty(), e, l, n, b)?
         {
             return Ok(false);
         }
-        let metadata = matching::sequence(row[8])?;
         match self {
             Self::Family(x) => {
-                if row[9] != 0 || !matching::sequence(row[7])?.is_empty() {
+                if row.inductive != 0 || !empty(row.rules)? {
                     return Err(ResourceError::Invariant);
                 }
-                Ok(metadata
-                    == [
-                        1,
-                        u32::from(x.is_unsafe),
-                        2,
-                        u32::from(x.is_recursive),
-                        3,
-                        u32::from(x.is_reflexive),
-                        5,
-                        x.num_params,
-                        6,
-                        x.num_indices,
-                        7,
-                        x.num_nested,
-                    ]
-                    && names(row[5], list(request.names, x.all)?, n, b)?
-                    && names(row[6], list(request.names, x.constructors)?, n, b)?)
+                Ok(metadata(
+                    row.metadata,
+                    &[
+                        (key::UNSAFE, u32::from(x.is_unsafe)),
+                        (key::RECURSIVE, u32::from(x.is_recursive)),
+                        (key::REFLEXIVE, u32::from(x.is_reflexive)),
+                        (key::PARAMETERS, x.num_params),
+                        (key::INDICES, x.num_indices),
+                        (key::NESTED, x.num_nested),
+                    ],
+                )? && names(row.all, list(request.names, x.all)?, n, b)?
+                    && names(row.constructors, list(request.names, x.constructors)?, n, b)?)
             }
             Self::Constructor(x) => {
-                if !matching::sequence(row[5])?.is_empty()
-                    || !matching::sequence(row[6])?.is_empty()
-                    || !matching::sequence(row[7])?.is_empty()
-                {
+                if !empty(row.all)? || !empty(row.constructors)? || !empty(row.rules)? {
                     return Err(ResourceError::Invariant);
                 }
-                Ok(metadata
-                    == [
-                        1,
-                        u32::from(x.is_unsafe),
-                        5,
-                        x.num_params,
-                        8,
-                        x.num_fields,
-                        9,
-                        x.index,
-                    ]
-                    && matching::name(row[9], x.inductive, n, b)?)
+                Ok(metadata(
+                    row.metadata,
+                    &[
+                        (key::UNSAFE, u32::from(x.is_unsafe)),
+                        (key::PARAMETERS, x.num_params),
+                        (key::FIELDS, x.num_fields),
+                        (key::CONSTRUCTOR_INDEX, x.index),
+                    ],
+                )? && matching::name(row.inductive, x.inductive, n, b)?)
             }
             Self::Recursor(x) => {
-                if row[9] != 0 || !matching::sequence(row[6])?.is_empty() {
+                if row.inductive != 0 || !empty(row.constructors)? {
                     return Err(ResourceError::Invariant);
                 }
-                if metadata
-                    != [
-                        1,
-                        u32::from(x.is_unsafe),
-                        4,
-                        u32::from(x.k),
-                        5,
-                        x.num_params,
-                        6,
-                        x.num_indices,
-                        10,
-                        x.num_motives,
-                        11,
-                        x.num_minors,
-                    ]
-                    || !names(row[5], list(request.names, x.all)?, n, b)?
+                if !metadata(
+                    row.metadata,
+                    &[
+                        (key::UNSAFE, u32::from(x.is_unsafe)),
+                        (key::K, u32::from(x.k)),
+                        (key::PARAMETERS, x.num_params),
+                        (key::INDICES, x.num_indices),
+                        (key::MOTIVES, x.num_motives),
+                        (key::MINORS, x.num_minors),
+                    ],
+                )? || !names(row.all, list(request.names, x.all)?, n, b)?
                 {
                     return Ok(false);
                 }
                 let rules = list(request.rules, x.rules)?;
-                let expected = matching::sequence(row[7])?;
-                if expected.len() % 3 != 0 {
+                let (expected, rest) = matching::sequence(row.rules)?.as_chunks::<3>();
+                if !rest.is_empty() {
                     return Err(ResourceError::Invariant);
                 }
-                if expected.len() / 3 != rules.len() {
+                if expected.len() != rules.len() {
                     return Ok(false);
                 }
                 b.charge_work(rules.len() as u64 + 1)?;
-                for (expected, actual) in expected.as_chunks::<3>().0.iter().zip(rules) {
-                    if expected[1] != actual.num_fields
-                        || !matching::name(expected[0], actual.constructor, n, b)?
-                        || !matching::expression(expected[2], actual.rhs, e, l, n, b)?
+                for (&[constructor, fields, rhs], actual) in expected.iter().zip(rules) {
+                    if fields != actual.num_fields
+                        || !matching::name(constructor, actual.constructor, n, b)?
+                        || !matching::expression(rhs, actual.rhs, e, l, n, b)?
                     {
                         return Ok(false);
                     }
@@ -268,11 +342,12 @@ impl Environment {
                         manifest::DECLARATIONS.len() as u64 + manifest::MASK_WORDS as u64,
                     )?;
                     for (index, row) in manifest::DECLARATIONS.iter().enumerate() {
-                        if row[0] != expected_name
-                            || row[1] != member.kind()
-                            || row[11] != group_id
+                        let row = Declaration::from(row);
+                        if row.name != expected_name
+                            || row.kind != member.kind()
+                            || row.group != group_id
                             || manifest::ALTERNATIVE_PIN_MASKS[index] & (1 << pin) == 0
-                            || !previous.dependencies(pin, row[10], &internal)?
+                            || !previous.dependencies(pin, row.dependencies, &internal)?
                         {
                             continue;
                         }

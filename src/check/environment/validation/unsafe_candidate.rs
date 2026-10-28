@@ -25,7 +25,7 @@ impl State {
         let negative = decoder
             .declaration_session(budget, |work| {
                 let result = (|| {
-                    work.check_root_scope(request.parameters, &[request.ty, value])?;
+                    work.check_input_scope(request.parameters, &[request.ty, value])?;
                     type_path = Some(work.check_type(
                         request.ty,
                         false,
@@ -68,7 +68,7 @@ impl State {
                 #[cfg(feature = "introspection")]
                 let mut compared = None;
                 let result = (|| {
-                    work.check_root_scope(request.parameters, &[request.ty, value])?;
+                    work.check_input_scope(request.parameters, &[request.ty, value])?;
                     let inferred =
                         work.infer_at(value, ReductionPath::start(), candidate, &self.environment)?;
                     #[cfg(feature = "introspection")]

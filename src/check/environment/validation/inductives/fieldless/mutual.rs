@@ -316,12 +316,12 @@ impl State {
                     |work, members| {
                         let mut offset = 0;
                         for family in request.types {
-                            work.check_root_scope(parameters, &[family.ty])?;
+                            work.check_input_scope(parameters, &[family.ty])?;
                             for _ in list(request.names, family.constructors)? {
                                 let constructor =
                                     &request.constructors[plan.constructors[offset] as usize];
                                 offset += 1;
-                                work.check_root_scope(parameters, &[constructor.ty])?;
+                                work.check_input_scope(parameters, &[constructor.ty])?;
                                 if !raw_constructor(
                                     work,
                                     family,

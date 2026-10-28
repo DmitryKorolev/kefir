@@ -657,13 +657,13 @@ impl State {
         let mut summary: Option<(usize, LevelPositive, LevelZero)> = None;
         let negative = decoder
             .declaration_session(budget, |work| {
-                work.check_root_scope(parameters, &[family.ty])?;
+                work.check_input_scope(parameters, &[family.ty])?;
                 families::with_set(
                     work,
                     request.types.iter().map(|family| family.name),
                     |work, members| {
                         for constructor in request.constructors {
-                            work.check_root_scope(parameters, &[constructor.ty])?;
+                            work.check_input_scope(parameters, &[constructor.ty])?;
                             if !raw_constructor(
                                 work,
                                 family,
@@ -1020,17 +1020,6 @@ impl State {
                 budget,
             )
             .map_err(resource)?;
-        let getbang = self
-            .environment
-            .prepare_getbang_group(
-                self.environment.getbang,
-                request,
-                decoder.syntax().0,
-                decoder.syntax().1,
-                decoder.syntax().2,
-                budget,
-            )
-            .map_err(resource)?;
         let finite = self
             .environment
             .prepare_finite_group(
@@ -1077,7 +1066,6 @@ impl State {
         self.environment.commit_predicates(predicates);
         self.environment.native_natural = native_natural;
         self.environment.string = string;
-        self.environment.getbang = getbang;
         self.environment.finite = finite;
         self.checked = next;
         budget.checked_declarations(next);

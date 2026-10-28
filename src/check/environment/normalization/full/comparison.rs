@@ -24,6 +24,7 @@ use crate::syntax::names::Names;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Evidence {
     Sort,
+    SortPi,
     Natural,
     DistinctLocals,
     RigidArguments,
@@ -1755,6 +1756,19 @@ impl Machine {
                             UniverseComparison::NotEqual => Decision::Different(Evidence::Sort),
                         };
                         return self.finish(decision, locals, ledger, budget);
+                    }
+                    // Sort/Pi pair: both forms are weak-head normal,
+                    // neither is a proof (each one's type is a Sort whose own
+                    // type is a successor Sort) and no eta, unit, literal or
+                    // elimination alternative has a head to act on.
+                    (ExprKind::Sort(_), ExprKind::Pi(..))
+                    | (ExprKind::Pi(..), ExprKind::Sort(_)) => {
+                        return self.finish(
+                            Decision::Different(Evidence::SortPi),
+                            locals,
+                            ledger,
+                            budget,
+                        );
                     }
                     _ => {}
                 }

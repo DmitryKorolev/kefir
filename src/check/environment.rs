@@ -24,7 +24,6 @@ impl CheckednessMint {
 mod annotations;
 mod constant_use;
 mod finite;
-mod getbang;
 pub(crate) mod kernel;
 pub(crate) use finite::{FiniteRequest, Referent as FiniteReferent};
 pub(crate) mod instantiation;
@@ -183,18 +182,25 @@ pub(crate) struct Environment {
     native_natural: native_natural::Certificate,
     predicates: predicates::Certificate,
     string: string::Certificate,
-    getbang: getbang::Certificate,
     finite: finite::Certificate,
     quotient: Option<quotient::Package>,
     annotation_identity: [u32; 4], // committed slot + 1; zero means uncertified
     committed: u32,
     epoch: u32,
     stage: Option<Stage>,
+    /// Run-lifetime "no rule" memo: one bit per canonical name key,
+    /// covering `by_name`. A set bit means a full-allowance derivation of that
+    /// constant found no rule; it only withholds an optional derivation, and
+    /// no result, equality or failure is concluded from it. Scope: this run's
+    /// environment, all declarations, attempts and modes; bits are never
+    /// cleared, so a stale bit (a retired staged name) costs speed only.
+    no_rule: Vec<std::sync::atomic::AtomicU64>,
 }
-// Eight Vec headers and the phase/frontier state retain only original roots.
-// Fixed certificates include the160-byte remaining-Nat certificate, for904bytes
+// Nine Vec headers (the last the no-rule memo) and the phase/frontier
+// state retain only original roots.
+// Fixed certificates include the160-byte remaining-Nat certificate, for 744 bytes
 // total. Entry layout remains48bytes; no per-declaration stage/certificate field.
-const _: () = assert!(size_of::<Environment>() == 904);
+const _: () = assert!(size_of::<Environment>() == 744);
 // Preparation-only, same-owner checkpoint minted before begin_stage. It cannot
 // authorize publication or generated-root lookup; it only bounds retirement.
 struct SignatureStageCheckpoint {
@@ -204,6 +210,22 @@ struct SignatureStageCheckpoint {
 }
 const _: () = assert!(size_of::<SignatureStageCheckpoint>() == 40);
 impl Environment {
+    /// Whether the memo records no rule for canonical name `canon`.
+    pub(crate) fn no_rule(&self, canon: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.no_rule
+            .get(canon as usize / 64)
+            .is_some_and(|w| w.load(Relaxed) >> (canon % 64) & 1 == 1)
+    }
+    /// Record no rule for `canon`; a name outside `by_name` is not recorded.
+    pub(crate) fn set_no_rule(&self, canon: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // One checking thread at a time owns the environment; a load and a
+        // store (not a read-modify-write) suffice.
+        if let Some(w) = self.no_rule.get(canon as usize / 64) {
+            w.store(w.load(Relaxed) | 1 << (canon % 64), Relaxed);
+        }
+    }
     pub(crate) fn len(&self) -> usize {
         self.committed as usize
     }
@@ -359,6 +381,7 @@ impl Environment {
         b.grow_vec(&mut self.by_name, index_end)?;
         b.grow_vec(&mut self.names, name_end)?;
         b.grow_vec(&mut self.hints, hint_end)?;
+        b.grow_vec(&mut self.no_rule, index_end.div_ceil(64))?;
         let type_slot = match (request.kind, request.ty) {
             (StoredKind::Quotient(a), TypeSource::Quotient(b)) if a == b => 0,
             (StoredKind::Signature(_), TypeSource::Auxiliary(slot))
@@ -390,6 +413,8 @@ impl Environment {
             },
         };
         self.by_name.resize(index_end, 0);
+        self.no_rule
+            .resize_with(index_end.div_ceil(64), Default::default);
         self.names.extend_from_slice(request.parameters);
         self.names.extend_from_slice(request.all);
         self.hints.extend_from_slice(bytes);

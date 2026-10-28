@@ -50,6 +50,7 @@ struct Owned {
     renamed_envs: Map<(u32, u64, u32), u32>,
     nat_type: u32,
     nat_ctors: Option<(u32, u32, u32)>,
+    derived: derived::Kept,
 }
 impl Owned {
     fn take(k: &mut Kernel<'_, '_>) -> Self {
@@ -100,6 +101,7 @@ impl Owned {
             renamed_envs: std::mem::take(&mut k.renamed_envs),
             nat_type: k.nat_type,
             nat_ctors: k.nat_ctors,
+            derived: k.derived.take_kept(),
         }
     }
     fn install(self, k: &mut Kernel<'_, '_>) {
@@ -150,6 +152,7 @@ impl Owned {
         k.renamed_envs = self.renamed_envs;
         k.nat_type = self.nat_type;
         k.nat_ctors = self.nat_ctors;
+        k.derived.install_kept(self.derived);
     }
 }
 
@@ -223,7 +226,7 @@ fn drop_vec<T>(k: &mut Kernel<'_, '_>, values: Vec<T>) -> R<()> {
     drop(values);
     release(k, bytes as u64)
 }
-fn drop_map<K, V>(k: &mut Kernel<'_, '_>, values: Map<K, V>) -> R<()> {
+pub(super) fn drop_map<K, V>(k: &mut Kernel<'_, '_>, values: Map<K, V>) -> R<()> {
     let bytes = if values.is_empty() {
         0
     } else {
@@ -346,6 +349,8 @@ impl Retention {
         drop_lossy(k, syntax)?;
         let markers = std::mem::take(&mut k.marker_vals);
         drop_map(k, markers)?;
+        // Only positive rule trees travel with the graph.
+        k.keep_trees()?;
         // Count the persistent header exactly once, even before its allocation.
         if k.reserved
             .saturating_add(level_bytes as u64)

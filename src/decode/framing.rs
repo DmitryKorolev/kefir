@@ -214,6 +214,32 @@ fn find_newline(bytes: &[u8]) -> Option<usize> {
     const LFS: u64 = u64::from_le_bytes([b'\n'; 8]);
 
     let mut start = 0;
+    while start + 32 <= bytes.len() {
+        // Four independent u64 probes stay inside the original bounded window.
+        // Select the first matching word before locating its first newline.
+        let probe = |offset: usize| {
+            let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            let equal = word ^ LFS;
+            equal.wrapping_sub(ONES) & !equal & HIGHS
+        };
+        let m0 = probe(start);
+        let m1 = probe(start + 8);
+        let m2 = probe(start + 16);
+        let m3 = probe(start + 24);
+        if (m0 | m1 | m2 | m3) != 0 {
+            let (offset, mask) = if m0 != 0 {
+                (0, m0)
+            } else if m1 != 0 {
+                (8, m1)
+            } else if m2 != 0 {
+                (16, m2)
+            } else {
+                (24, m3)
+            };
+            return Some(start + offset + mask.trailing_zeros() as usize / 8);
+        }
+        start += 32;
+    }
     while start + 8 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap());
         let equal = word ^ LFS;

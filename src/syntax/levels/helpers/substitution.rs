@@ -35,6 +35,7 @@ impl Map {
         if hash == 0 { 1 } else { hash }
     }
 
+    #[inline(always)]
     fn position(
         entries: &[Entry],
         key: Entry,

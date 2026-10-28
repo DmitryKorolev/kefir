@@ -38,6 +38,7 @@ use std::hash::BuildHasherDefault;
 use std::mem::size_of;
 use std::num::NonZeroU32;
 
+mod derived;
 mod read_large;
 mod retention;
 pub(super) use retention::{Retention, select_cleanup};
@@ -73,7 +74,11 @@ struct Lossy<K, V> {
 const LOSSY_START: usize = 1 << 4;
 /// Bytes of one store kept for reuse between attempts (uncharged).
 const RETAIN: usize = 1 << 18;
-const LOSSY_CAP: usize = 1 << 21;
+/// Lossy tables stop doubling at this many slots; a full table evicts.
+const LOSSY_CAP: usize = 1 << 19;
+/// From this logical size the exact memo doubles at three-quarter load
+/// instead of half load.
+const MEMO_DENSE: usize = 1 << 21;
 trait Resettable {
     fn reset_table(&mut self);
 }
@@ -276,25 +281,21 @@ impl<K: LossyKey, V: Copy> Lossy<K, V> {
             let grown = self.size * 2;
             charge_bytes(b, reserved, (grown - self.size) * Self::SLOT)?;
             physical(&mut self.slots, grown)?;
-            let old = self.generation;
-            self.next_generation();
+            // Doubling the mask splits old bucket i into i or i+size. Only
+            // reset changes the generation, and size never shrinks within one,
+            // so no upper-half bucket holds a current row: a row whose new
+            // bit is set moves up and leaves its bucket vacant, every other
+            // row stays. Migration preserves exactly `used` live rows and the
+            // placement a fresh insertion at the grown size would choose.
             let g = self.generation;
-            if g < old {
-                self.used = 0;
-            } else {
-                // Doubling the mask splits old bucket i into i or i+size.
-                // Distinct old buckets have distinct destinations, and an
-                // upper-half write cannot overwrite an unvisited old row.
-                // Old lower copies become stale under the fresh generation;
-                // migration preserves exactly `used` live rows.
-                for at in 0..self.size {
-                    if let Some((entry, key, val)) = self.slots[at]
-                        && entry == old
-                    {
-                        let i = self.index(&key, grown);
-                        debug_assert!(i == at || i == at + self.size);
-                        self.slots[i] = Some((g, key, val));
-                    }
+            let (low, high) = self.slots[..grown].split_at_mut(self.size);
+            for (row, up) in low.iter_mut().zip(high.iter_mut()) {
+                if let Some((entry, key, _)) = row
+                    && *entry == g
+                    && Self::key_hash(key) & self.size != 0
+                {
+                    debug_assert!(!matches!(up, Some((e, ..)) if *e == g));
+                    *up = row.take();
                 }
             }
             self.size = grown;
@@ -309,10 +310,11 @@ impl<K: LossyKey, V: Copy> Lossy<K, V> {
 /// An exact open-addressing table (linear probing) for the evaluation memo:
 /// call-by-need sharing must never be lost, or a DAG-shaped term re-evaluates
 /// shared subterms (measured: shared-subterm 13× with a lossy memo). It grows
-/// at half load under the attempt storage budget; charges follow the logical
-/// size only. Resize reserves both logical buffers before allocation and
-/// retires the old logical charge only after in-place migration. No incomplete
-/// insertion supplies an evaluation result.
+/// at half load, or three-quarter load from `MEMO_DENSE` slots, under the
+/// attempt storage budget; charges follow the logical size only. Resize
+/// reserves both logical buffers before allocation and retires the old logical
+/// charge only after in-place migration. No incomplete insertion supplies an
+/// evaluation result.
 ///
 /// A slot packs the key and value into five words (dense-entry
 /// trial): expression slot, level instance with the read-key tag in its two
@@ -356,6 +358,16 @@ impl Resettable for Exact {
 }
 impl Exact {
     const SLOT: usize = size_of::<MemoSlot>();
+    /// Entries at which a table of `size` slots doubles: always below `size`,
+    /// so a vacancy remains for migration and probing.
+    #[inline]
+    fn grow_at(size: usize) -> usize {
+        if size >= MEMO_DENSE {
+            size / 4 * 3
+        } else {
+            size / 2
+        }
+    }
     #[inline]
     fn pack(k: &MemoKey) -> Option<[u32; 4]> {
         let (e, li, tag, k1, k2) = *k;
@@ -396,7 +408,7 @@ impl Exact {
             charge_bytes(b, reserved, LOSSY_START * Self::SLOT)?;
             vacant_slots(&mut self.slots, LOSSY_START)?;
             self.size = LOSSY_START;
-        } else if self.used >= self.size / 2 {
+        } else if self.used >= Self::grow_at(self.size) {
             let grown = self.size.checked_mul(2).ok_or(ResourceError::Counter)?;
             let new_bytes = grown
                 .checked_mul(Self::SLOT)
@@ -424,7 +436,7 @@ impl Exact {
             // cuts (vacant and vacant + old_size) stay empty: a home rank is
             // at most its original slot rank, so reinsertion stops by that rank
             // in its half. Later clearing cannot open a completed probe path.
-            // Half load guarantees an original vacancy and termination.
+            // Growth below full load guarantees an original vacancy and termination.
             let first = (vacant + 1) & (old_size - 1);
             for range in [first..old_size, 0..first] {
                 for at in range {
@@ -1086,11 +1098,8 @@ pub(crate) struct Kernel<'e, 'w> {
     nat_type: u32,
     quot_types: Option<[ExprId; 4]>,
     wants_quot: bool,
-    /// Canonical name of the certified Get! root (+1; 0 none; NONE unknown).
-    getbang_root: u32,
-    getbang_cons: u32,
-    /// Canonical name of the certified `List.get?Internal` slot (+1; 0 none).
-    getq_root: u32,
+    /// Derived rule trees and unfolding heat; this attempt only.
+    derived: derived::Derived,
     str_expansion: Map<u32, u32>,
     nat_ctors: Option<(u32, u32, u32)>,
     scratch: Vec<Scratch>,
@@ -1220,9 +1229,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             nat_type: NONE,
             quot_types: None,
             wants_quot: false,
-            getbang_root: NONE,
-            getbang_cons: NONE,
-            getq_root: 0,
+            derived: derived::Derived::default(),
             str_expansion: Map::default(),
             nat_ctors: None,
             scratch: Vec::new(),
@@ -1724,7 +1731,14 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let (kt, k1, k2) = read_key;
         let key = (form * 4 + kt, c.dom.slot(), c.body.slot(), c.li, k1, k2);
         let hash = Lossy::<(u32, u32, u32, u32, u32, u32), u32>::key_hash(&key);
-        if let Some(v) = self.clo_index.probe_hashed(&key, hash) {
+        // Unlike env_lossy/val_index/cell_index, clo_index is never reviewed:
+        // its lookup/hit counts are diagnostics, not cache-policy inputs.
+        // Preserve the same full-key/generation read without production counts.
+        #[cfg(feature = "introspection")]
+        let cached = self.clo_index.probe_hashed(&key, hash);
+        #[cfg(not(feature = "introspection"))]
+        let cached = self.clo_index.get_hashed(&key, hash).copied();
+        if let Some(v) = cached {
             return Ok(v);
         }
         let c = if loose == 0 { Clo { env: 0, ..c } } else { c };
@@ -3174,39 +3188,28 @@ impl<'e, 'w> Kernel<'e, 'w> {
     /// Replay the cells strictly after `base` (up to the tip) onto `acc`.
     fn replay_from(&mut self, mut acc: u32, spine: u32, base: u32) -> R<u32> {
         let mut items = self.spine_items_from(spine, base)?;
-        let mut run = self.scratch.pop().unwrap_or_default();
-        run.clear();
-        let mut result = Ok(());
-        for s in items.iter_mut() {
-            let c = self.cells[*s as usize];
-            if c.tag == 0 {
-                if let Err(e) = self.scratch_room(&mut run, 1) {
-                    result = Err(e);
-                    break;
+        let result = (|| {
+            let mut start = 0;
+            for at in 0..items.len() {
+                // Invariant: unvisited entries are cell IDs; the completed
+                // range start..at holds the original raw argument value IDs.
+                // Nested application owns no borrow of the scratch pool.
+                let c = self.cells[items[at] as usize];
+                if c.tag == 0 {
+                    items[at] = c.item;
+                    continue;
                 }
-                run.push(c.item);
-                continue;
+                acc = self.apply_many(acc, &items[start..at])?;
+                acc = self.proj(acc, c.tag - 1, c.item)?;
+                start = at + 1;
             }
-            let step = self
-                .apply_many(acc, &run)
-                .and_then(|f| self.proj(f, c.tag - 1, c.item));
-            run.clear();
-            match step {
-                Ok(v) => acc = v,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
+            if start < items.len() {
+                acc = self.apply_many(acc, &items[start..])?;
             }
-        }
-        if result.is_ok() && !run.is_empty() {
-            match self.apply_many(acc, &run) {
-                Ok(v) => acc = v,
-                Err(e) => result = Err(e),
-            }
-        }
+            Ok(acc)
+        })();
         items.clear();
-        self.scratch_finish(result.map(|()| acc), [items, run])
+        self.scratch_finish(result, [items])
     }
     fn let_bit(&self, bit: u64) -> bool {
         self.let_marks
@@ -3285,9 +3288,6 @@ impl<'e, 'w> Kernel<'e, 'w> {
             }
             Err(e) => Err(e),
         }
-    }
-    fn nat_value(&mut self, v: u32) -> R<Option<NatLit>> {
-        self.nat_value_in(v, false)
     }
     /// A natural literal for `v`. Inside `lazy_delta` (`lazy`), a let-bound
     /// operand is reduced only within `LET_FOLD_BUDGET`; past it there is no
@@ -3514,115 +3514,6 @@ impl<'e, 'w> Kernel<'e, 'w> {
             }
         };
         Ok(Some(self.nat(r)?))
-    }
-    /// Certified `Get!`: the committed root applied to exactly
-    /// `(α, inst, list, i)` with a literal `i` selects the `i`-th element of a
-    /// cons list. Nil, out-of-range or any other shape unfolds ordinarily.
-    fn getbang(&mut self, ci: u32, li: u32, spine: u32) -> R<Option<u32>> {
-        if self.getbang_root == NONE {
-            self.getbang_root = 0;
-            let env = self.env;
-            if let Some(symbols) = env.getbang_symbols(self.before, self.formation, self.b)? {
-                self.getbang_root = self.canon(symbols[0])?.wrapping_add(1);
-                self.getbang_cons = self.canon(symbols[5])?;
-                // `List.get?Internal` is itself a root of the certified
-                // closure: its definition matched.
-                self.getq_root = self.canon(symbols[6])?.wrapping_add(1);
-            }
-        }
-        if self.getbang_root != 0
-            && self.const_view(ci)?.canon.wrapping_add(1) == self.getq_root
-            && self.cells[spine as usize].len == 3
-        {
-            return self.getq_skip(ci, li, spine);
-        }
-        if self.getbang_root == 0
-            || self.const_view(ci)?.canon.wrapping_add(1) != self.getbang_root
-            || self.cells[spine as usize].len != 4
-        {
-            return Ok(None);
-        }
-        let Some(args) = self.spine_args_opt(spine)? else {
-            return Ok(None);
-        };
-        let res = (|| {
-            let Some(NatLit::Small(mut k)) = self.nat_value(args[3])? else {
-                return Ok(None);
-            };
-            let mut list = args[2];
-            loop {
-                self.step()?;
-                let w = self.whnf(list)?;
-                let Val::Const {
-                    ci: c, spine: cs, ..
-                } = self.vals[w as usize]
-                else {
-                    return Ok(None);
-                };
-                if self.const_view(c)?.canon != self.getbang_cons
-                    || self.cells[cs as usize].len != 3
-                {
-                    return Ok(None);
-                }
-                let (Some(tail), Some(head)) = (
-                    self.arg_item(cs),
-                    self.arg_item(self.cells[cs as usize].prev),
-                ) else {
-                    return Ok(None);
-                };
-                if k == 0 {
-                    return Ok(Some(head));
-                }
-                k -= 1;
-                list = tail;
-            }
-        })();
-        self.scratch_finish(res, [args])
-    }
-    /// `List.get?Internal α l i` for a literal `i = k > 0` whose list exposes
-    /// at least `k` certified cons cells: skip them, leaving
-    /// `List.get?Internal α tail 0` for ordinary unfolding. Each skipped step
-    /// is the certified definition's own recursive case
-    /// (`get?Internal (a :: as) (n + 1) ≡ get?Internal as n`); any other shape
-    /// unfolds ordinarily.
-    fn getq_skip(&mut self, ci: u32, li: u32, spine: u32) -> R<Option<u32>> {
-        let Some(args) = self.spine_args_opt(spine)? else {
-            return Ok(None);
-        };
-        let res = (|| -> R<Option<u32>> {
-            let Some(NatLit::Small(k)) = self.nat_value(args[2])? else {
-                return Ok(None);
-            };
-            if k == 0 {
-                return Ok(None);
-            }
-            let mut list = args[1];
-            for _ in 0..k {
-                self.step()?;
-                let w = self.whnf(list)?;
-                let Val::Const {
-                    ci: c, spine: cs, ..
-                } = self.vals[w as usize]
-                else {
-                    return Ok(None);
-                };
-                if self.const_view(c)?.canon != self.getbang_cons
-                    || self.cells[cs as usize].len != 3
-                {
-                    return Ok(None);
-                }
-                let Some(tail) = self.arg_item(cs) else {
-                    return Ok(None);
-                };
-                list = tail;
-            }
-            let zero = self.nat(NatLit::Small(0))?;
-            let s1 = self.cell(0, args[0], 0)?;
-            let s2 = self.cell(s1, list, 0)?;
-            let s3 = self.cell(s2, zero, 0)?;
-            Ok(Some(self.push(Val::Const { ci, li, spine: s3 })?))
-        })();
-        self.scratch_finish(res, [args])
     }
     /// `Quot.lift f h (Quot.mk r a) ↦ f a` and `Quot.ind h (Quot.mk r a) ↦ h a`.
     fn quot_reduce(&mut self, ci: u32, spine: u32) -> R<Option<u32>> {
@@ -4490,16 +4381,57 @@ impl<'e, 'w> Kernel<'e, 'w> {
                         head = f;
                     }
                     let mut fty = self.infer(head, env, li, check)?;
+                    // Syntactic Pi telescope. `pending` is a Pi whose
+                    // closure was never built: it denotes exactly the Pi value
+                    // `instantiate` would return (evaluating a syntactic Pi
+                    // gives that closure, and a Pi closure is its own weak head
+                    // normal form). Private loop state, never published.
+                    let mut pending: Option<Clo> = None;
                     for i in (0..args.len()).rev() {
                         let a = ExprId::from_stored_original(args[i]);
-                        let w = self.pi_like(fty)?;
+                        let pi = match pending.take() {
+                            Some(c) => c,
+                            None => {
+                                let w = self.pi_like(fty)?;
+                                match self.vals[w as usize] {
+                                    Val::Pi(c) => c,
+                                    // Lambda types and arrows: the ordinary rule.
+                                    _ => {
+                                        if check {
+                                            let dom = self.binder_dom(w)?;
+                                            self.check_expr(a, dom, env)?;
+                                        }
+                                        let av = self.thunk(a, env, li)?;
+                                        fty = self.instantiate(w, av)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         if check {
-                            let dom = self.binder_dom(w)?;
+                            let dom = self.eval(pi.dom, pi.env, pi.li)?;
                             self.check_expr(a, dom, env)?;
                         }
                         let av = self.thunk(a, env, li)?;
-                        fty = self.instantiate(w, av)?;
+                        let bound = self.env_push(pi.env, av, NONE)?;
+                        if i != 0
+                            && let ExprKind::Pi(_, dom, body, _) = self
+                                .exprs
+                                .get(pi.body, self.b)?
+                                .kind(self.exprs, self.levels, self.b)?
+                        {
+                            pending = Some(Clo {
+                                dom,
+                                body,
+                                env: bound,
+                                li: pi.li,
+                            });
+                        } else {
+                            fty = self.eval(pi.body, bound, pi.li)?;
+                        }
                     }
+                    // The last argument always evaluates its codomain.
+                    debug_assert!(pending.is_none());
                     Ok(fty)
                 })();
                 self.scratch_finish(res, [args])
@@ -5934,10 +5866,10 @@ impl<'e, 'w> Kernel<'e, 'w> {
             return Ok(cached);
         }
         // Only completed positive reductions are installed. An unsupported
-        // route, failed certification, exhausted allowance or resource error
+        // route, unmatched rule guard, exhausted allowance or resource error
         // cannot create a cached result. It remains a term, not an equality or
         // checked-inference certificate.
-        let reduced = if let Some(sel) = self.getbang(ci, li, spine)? {
+        let reduced = if let Some(sel) = self.derived_unfold(ci, li, spine)? {
             self.whnf_core(sel)?
         } else {
             let n = self.unfold(ci, li, spine)?;
@@ -6337,7 +6269,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         reason = "test-only observer omitted from public source"
     )]
     fn struct_eta(&mut self, x: u32, ctor: u32) -> R<bool> {
-        let Val::Const { ci, spine, .. } = self.vals[ctor as usize] else {
+        let Val::Const { ci, li, spine } = self.vals[ctor as usize] else {
             return Ok(false);
         };
         let Some((family, _)) = self.const_view(ci)?.ctor else {
@@ -6383,7 +6315,39 @@ impl<'e, 'w> Kernel<'e, 'w> {
             return Ok(false);
         };
         let res = (|| {
+            if nf == 0 {
+                return Ok(true);
+            }
+            // Conversion's checked-term premise supplies field typing. Equal
+            // parent types and earlier compared fields transport the actual
+            // constructor domain to x's projection, including dependencies on
+            // earlier proofs (by proof irrelevance). Classification alone is
+            // never permission to compare an unchecked constructor.
+            // Keep the existing restriction on projecting data from Prop.
+            let mut typed = match self.prop_status(tc) {
+                Ok(Some(false)) => true,
+                Ok(_) | Err(KErr::Unsupported) => false,
+                Err(error) => return Err(error),
+            };
+            let (mut fty, mut at) = (NONE, 0usize);
             for i in 0..nf {
+                if typed {
+                    let status = self.arg_is_proof(
+                        &mut fty,
+                        &mut at,
+                        Err((ci, li)),
+                        &args,
+                        (ind.nparams + i) as usize,
+                    );
+                    match status {
+                        Ok(Some(true)) => {
+                            continue;
+                        }
+                        Ok(Some(false)) => {}
+                        Ok(None) | Err(KErr::Unsupported) => typed = false,
+                        Err(error) => return Err(error),
+                    }
+                }
                 let p = self.proj(x, i, fci)?;
                 if !self.defeq(p, args[(ind.nparams + i) as usize])? {
                     return Ok(false);

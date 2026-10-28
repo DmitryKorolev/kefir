@@ -28,8 +28,8 @@ pub(crate) struct State {
     checked: u64,
     failure: Option<FailureReport>,
 }
-// Includes the exact Get! certificate; declaration entries remain unchanged.
-const _: () = assert!(size_of::<State>() == 1016 + size_of::<theorem_judgments::Judgments>());
+// Declaration entries remain unchanged.
+const _: () = assert!(size_of::<State>() == 856 + size_of::<theorem_judgments::Judgments>());
 fn unsupported() -> FailureReport {
     FailureReport {
         outcome: FailureOutcome::Decline,
@@ -62,9 +62,12 @@ fn capture_ordinary(
             Negative::ExpectedSort | Negative::ExpectedPi | Negative::ExpectedProposition,
         ) => &[Rule::Formation, Rule::Inference],
         Stop::Judgment(Negative::TypeMismatch) => &[Rule::Inference, Rule::Conversion],
-        Stop::Judgment(Negative::DuplicateUniverseParameter) | Stop::Scope(_) => {
-            &[Rule::DeclarationPolicy]
-        }
+        Stop::Judgment(
+            Negative::DuplicateUniverseParameter
+            | Negative::UnknownUniverseParameter
+            | Negative::OpenDeclaration,
+        )
+        | Stop::Scope(_) => &[Rule::DeclarationPolicy],
         Stop::Judgment(
             Negative::MissingConstant | Negative::UnsafeReference | Negative::InvalidProjection,
         )
@@ -313,13 +316,15 @@ impl State {
                 #[cfg(feature = "introspection")]
                 let mut compared = None;
                 let result = (|| {
+                    // The decoded roots themselves, before any route
+                    // copies or evaluates them.
+                    let originals = [request.ty, request.value.unwrap_or(request.ty)];
+                    work.check_input_scope(request.parameters, &originals)?;
                     // Isolated value-kernel trial: a completed positive check
                     // replaces the ordinary route; anything else falls through
                     // to it unchanged. Mandatory resource errors stay terminal.
                     let kernel_scope = scope();
                     if super::kernel::eligible(request, &kernel_scope) {
-                        let originals = [request.ty, request.value.unwrap_or(request.ty)];
-                        work.check_root_scope(request.parameters, &originals)?;
                         if self
                             .theorem_judgments
                             .lookup(theorem_key, work.budget)
@@ -357,10 +362,14 @@ impl State {
                     {
                         captured_roots = (ty, value);
                     }
-                    if let Some(value) = value {
-                        work.check_root_scope(request.parameters, &[ty, value])?;
-                    } else {
-                        work.check_root_scope(request.parameters, &[ty])?;
+                    // Non-theorem roots are the originals checked above; only a
+                    // theorem's generated copy needs its own scope check.
+                    if request.kind == Kind::Theorem {
+                        if let Some(value) = value {
+                            work.check_root_scope(request.parameters, &[ty, value])?;
+                        } else {
+                            work.check_root_scope(request.parameters, &[ty])?;
+                        }
                     }
                     let type_path = work.check_type(
                         ty,
@@ -453,17 +462,6 @@ impl State {
                 budget,
             )
             .map_err(ResourceError::failure_report)?;
-        let getbang = self
-            .environment
-            .prepare_getbang_definition(
-                self.environment.getbang,
-                request,
-                names,
-                levels,
-                expressions,
-                budget,
-            )
-            .map_err(ResourceError::failure_report)?;
         let finite = self
             .environment
             .prepare_finite_definition(
@@ -490,7 +488,6 @@ impl State {
         self.environment.commit_predicates(predicates);
         self.environment.native_natural = native_natural;
         self.environment.string = string;
-        self.environment.getbang = getbang;
         self.environment.finite = finite;
         if let Some(pending) = pending {
             pending.commit();

@@ -97,10 +97,10 @@ impl Rejection {
         self.kind.wire()
     }
 }
-// Includes the exact Nat.div/Nat.mod frontiers and the Get! certificate.
+// Includes the exact Nat.div/Nat.mod frontiers.
 const _: () = assert!(
     std::mem::size_of::<Complete>()
-        == 1056 + std::mem::size_of::<super::theorem_judgments::Judgments>()
+        == 896 + std::mem::size_of::<super::theorem_judgments::Judgments>()
 );
 impl Complete {
     pub(crate) fn rejection(&self) -> Option<Rejection> {

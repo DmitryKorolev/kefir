@@ -121,7 +121,7 @@ impl State {
         // member. The subsequent signature phase grants typing only.
         for family in request.types {
             let parameters = list(request.names, family.parameters)?;
-            work.check_root_scope(parameters, &[family.ty])?;
+            work.check_input_scope(parameters, &[family.ty])?;
             work.check_type(
                 family.ty,
                 false,
@@ -171,7 +171,8 @@ impl State {
             }
             for constructor in request.constructors {
                 let parameters = list(request.names, constructor.parameters)?;
-                work.check_root_scope(parameters, &[constructor.ty])?;
+                // Keeps unsupported parameter contexts declining here.
+                work.check_input_closed(parameters, &[constructor.ty])?;
                 work.check_type(
                     constructor.ty,
                     false,

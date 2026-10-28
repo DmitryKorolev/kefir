@@ -246,6 +246,7 @@ impl Expressions {
         })
     }
 }
+#[inline(always)]
 fn schedule_expression(
     e: &Expressions,
     id: ExprId,

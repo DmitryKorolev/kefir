@@ -124,29 +124,69 @@ fn binder(work: &mut Working<'_>, ty: ExprId, path: ReductionPath) -> Result<Bin
 }
 fn close(
     work: &mut Working<'_>,
-    mut body: ExprId,
+    body: ExprId,
     binders: &[Binder],
     lambda: bool,
 ) -> Result<ExprId, Stop> {
-    for b in binders.iter().rev() {
+    close_by(work, body, binders.len(), |k| binders[k], lambda)
+}
+/// Closes `body` over the telescope `binder(0..n)`, outermost first, with one
+/// abstraction pass over the body and one over each binder type that has free
+/// variables. `ids[i]` becomes `Bound(i)`, so the body sees binder `n - 1` as 0
+/// and binder `k`'s type sees binder `k - 1` as 0 through binder 0 as `k - 1`:
+/// the same term as closing one binder at a time from the innermost, without
+/// rewriting the growing body once per binder. Binder ids are distinct
+/// (`binder` enters each one fresh); a repeat is an invariant failure in
+/// `bind`, never a verdict.
+fn close_by(
+    work: &mut Working<'_>,
+    mut body: ExprId,
+    n: usize,
+    binder: impl Fn(usize) -> Binder,
+    lambda: bool,
+) -> Result<ExprId, Stop> {
+    if n == 0 {
+        return Ok(body);
+    }
+    let mut ids: Vec<u32> = Vec::new();
+    work.budget.grow_vec(&mut ids, n)?;
+    ids.extend((0..n).rev().map(|k| binder(k).id.slot()));
+    let result = (|| {
         body = work.expressions.bind(
             body,
             0,
-            Binding::Abstract(&[b.id.slot()]),
+            Binding::Abstract(&ids),
             work.levels,
             work.names,
             work.budget,
         )?;
-        body = append(
-            work,
-            if lambda {
-                ExprKind::Lambda(NameId::ANONYMOUS, b.generated_ty, body, BinderInfo::Default)
-            } else {
-                ExprKind::Pi(NameId::ANONYMOUS, b.generated_ty, body, BinderInfo::Default)
-            },
-        )?;
-    }
-    Ok(body)
+        for k in (0..n).rev() {
+            let mut ty = binder(k).generated_ty;
+            if k != 0 && work.expressions.get(ty, work.budget)?.has_free() {
+                ty = work.expressions.bind(
+                    ty,
+                    0,
+                    Binding::Abstract(&ids[n - k..]),
+                    work.levels,
+                    work.names,
+                    work.budget,
+                )?;
+            }
+            body = append(
+                work,
+                if lambda {
+                    ExprKind::Lambda(NameId::ANONYMOUS, ty, body, BinderInfo::Default)
+                } else {
+                    ExprKind::Pi(NameId::ANONYMOUS, ty, body, BinderInfo::Default)
+                },
+            )?;
+        }
+        Ok::<_, Stop>(body)
+    })();
+    let bytes = ids.capacity() * std::mem::size_of::<u32>();
+    drop(ids);
+    work.budget.release(bytes as u64)?;
+    result
 }
 fn application_binders(
     work: &mut Working<'_>,
@@ -743,14 +783,36 @@ impl Scratch {
     fn close_fields(
         &self,
         work: &mut Working<'_>,
-        mut body: ExprId,
+        body: ExprId,
         index: usize,
         lambda: bool,
     ) -> Result<ExprId, Stop> {
-        for field in self.fields(index)?.iter().rev() {
-            body = close(work, body, std::slice::from_ref(&field.binder), lambda)?;
-        }
-        Ok(body)
+        let fields = self.fields(index)?;
+        close_by(work, body, fields.len(), |k| fields[k].binder, lambda)
+    }
+    /// Closes `body` over the parameters, then the motives and minors, then
+    /// `inner(0..m)`, in one `close_by` pass.
+    fn close_rule(
+        &self,
+        work: &mut Working<'_>,
+        body: ExprId,
+        m: usize,
+        inner: impl Fn(usize) -> Binder,
+        lambda: bool,
+    ) -> Result<ExprId, Stop> {
+        let p = self.parameters;
+        let base = p + self.indices;
+        let outer = p + (self.binders.len() - base);
+        let binder = |k: usize| {
+            if k < p {
+                self.binders[k]
+            } else if k < outer {
+                self.binders[base + k - p]
+            } else {
+                inner(k - outer)
+            }
+        };
+        close_by(work, body, outer + m, binder, lambda)
     }
     fn family_application(&self, work: &mut Working<'_>, name: NameId) -> Result<ExprId, Stop> {
         let member = self
@@ -879,9 +941,7 @@ impl Scratch {
             work,
             ExprKind::Pi(NameId::ANONYMOUS, ty, result, BinderInfo::Default),
         )?;
-        let result = close(work, result, indices, false)?;
-        let result = close(work, result, &self.binders[base..], false)?;
-        close(work, result, &self.binders[..self.parameters], false)
+        self.close_rule(work, result, indices.len(), |k| indices[k], false)
     }
     pub(super) fn rhs(
         &self,
@@ -953,9 +1013,8 @@ impl Scratch {
             work.budget.release(bytes as u64)?;
             result?;
         }
-        let body = self.close_fields(work, body, index, true)?;
-        let body = close(work, body, &self.binders[base..], true)?;
-        close(work, body, &self.binders[..self.parameters], true)
+        let fields = self.fields(index)?;
+        self.close_rule(work, body, fields.len(), |k| fields[k].binder, true)
     }
     /// Closed type of an owned generated rule; checked independently before
     /// restoration, then restored alongside its RHS for public rechecking.
@@ -968,9 +1027,8 @@ impl Scratch {
             self.constructor_results(index)?,
         )?;
         let result = append(work, ExprKind::App(result, self.constructors[index]))?;
-        let result = self.close_fields(work, result, index, false)?;
-        let result = close(work, result, &self.binders[base..], false)?;
-        close(work, result, &self.binders[..self.parameters], false)
+        let fields = self.fields(index)?;
+        self.close_rule(work, result, fields.len(), |k| fields[k].binder, false)
     }
     pub(super) fn recheck(
         &self,

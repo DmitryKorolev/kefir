@@ -23,6 +23,8 @@ pub(crate) enum Negative {
     ExpectedPi,
     ExpectedProposition,
     DuplicateUniverseParameter,
+    UnknownUniverseParameter,
+    OpenDeclaration,
     MissingConstant,
     UnsafeReference,
     InvalidProjection,
@@ -328,6 +330,45 @@ impl Working<'_> {
             .map_err(Stop::Scope);
         self.owned_failure = result.as_ref().err().copied();
         result
+    }
+    /// Classification for original input roots only: exactly the
+    /// decoded type/body of a declaration, inductive family or constructor.
+    /// A completed loose-variable, free-local or undeclared-parameter failure
+    /// there is a property of the export and rejects. Roots built by kefir
+    /// (copies, recursors, rules, nested auxiliaries) must use
+    /// `check_root_scope`, where the same failure is our defect and declines.
+    pub(crate) fn check_input_scope(
+        &mut self,
+        parameters: &[NameId],
+        roots: &[ExprId],
+    ) -> Result<(), Stop> {
+        match self.check_root_scope(parameters, roots) {
+            Err(Stop::Scope(ScopeError::OpenExpression(_))) => {
+                self.owned_failure = Some(Stop::Judgment(Negative::OpenDeclaration));
+                Err(Stop::Judgment(Negative::OpenDeclaration))
+            }
+            Err(Stop::Scope(ScopeError::UnknownParameter(_))) => {
+                self.owned_failure = Some(Stop::Judgment(Negative::UnknownUniverseParameter));
+                Err(Stop::Judgment(Negative::UnknownUniverseParameter))
+            }
+            other => other,
+        }
+    }
+    /// `check_input_scope` for original roots whose universe parameter context
+    /// is still outside the supported slice:
+    /// a loose variable rejects, an uncovered parameter keeps declining.
+    pub(crate) fn check_input_closed(
+        &mut self,
+        parameters: &[NameId],
+        roots: &[ExprId],
+    ) -> Result<(), Stop> {
+        match self.check_root_scope(parameters, roots) {
+            Err(Stop::Scope(ScopeError::OpenExpression(_))) => {
+                self.owned_failure = Some(Stop::Judgment(Negative::OpenDeclaration));
+                Err(Stop::Judgment(Negative::OpenDeclaration))
+            }
+            other => other,
+        }
     }
     /// Own one fixed-permission normalization region inside this declaration.
     /// The caller still supplies checked roots and validated environment entries;

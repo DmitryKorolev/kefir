@@ -2,7 +2,7 @@
 //! Listed values do not imply that every governed subsystem is implemented.
 
 pub(crate) const CACHE_BYTES_PER_SESSION: u64 = 1073741824;
-pub(crate) const CHARGING_REVISION: u64 = 4;
+pub(crate) const CHARGING_REVISION: u64 = 7;
 pub(crate) const CHECKPOINT_REVISION: u64 = 2;
 pub(crate) const CONTEXT_DEPTH: usize = 65536;
 pub(crate) const COUNTER_MAX: u64 = 18446744073709551615;

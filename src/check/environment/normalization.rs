@@ -123,7 +123,6 @@ enum Suspension {
     Natural,
     PredicateLeft,
     PredicateRight,
-    GetBangIndex,
     QuotientLift,
     QuotientInduction,
     Projection,

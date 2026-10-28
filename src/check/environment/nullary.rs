@@ -453,6 +453,7 @@ impl Environment {
             (self.recursors.capacity(), size_of::<RecursorRecord>()),
             (self.families.capacity(), size_of::<FamilyRecord>()),
             (self.rules.capacity(), size_of::<NullaryRule>()),
+            (self.no_rule.capacity(), size_of::<u64>()),
         ];
         let bytes = capacities
             .into_iter()

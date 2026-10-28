@@ -5,7 +5,6 @@
 //! No cache result or installed syntax may retain this machine after retirement.
 use super::*;
 use crate::syntax::levels::LevelZero;
-mod getbang;
 mod pending_application;
 mod predicate;
 mod structure;
@@ -341,28 +340,6 @@ impl Machine {
                         level_end: scope.level_end,
                     };
                     if exposure == Exposure::Full
-                        && scratch.applications.len() - scratch.base() == 4
-                        && getbang::root(&site, environment, levels, names, b)?
-                    {
-                        let end = scratch.applications.len();
-                        let index = scratch.applications[end - 4].argument;
-                        scratch.suspend(
-                            Iota {
-                                recursor: expression,
-                                end: u32::try_from(end).map_err(|_| ResourceError::Counter)?,
-                                payload: SuspensionPayload::Layout {
-                                    prefix: 0,
-                                    indices: 0,
-                                },
-                                kind: Suspension::GetBangIndex,
-                                exposure,
-                            },
-                            b,
-                        )?;
-                        expression = index;
-                        return Ok(None);
-                    }
-                    if exposure == Exposure::Full
                         && scratch.applications.len() - scratch.base() == 2
                     {
                         let end = scratch.applications.len();
@@ -685,25 +662,6 @@ impl Machine {
                         expression = expanded.expression;
                         path = expanded.path;
                         exposure = Exposure::Full;
-                        return Ok(None);
-                    }
-                    if frame.kind == Suspension::GetBangIndex {
-                        let next = getbang::resume(
-                            frame,
-                            Head { expression, path },
-                            scratch,
-                            scope,
-                            environment,
-                            expressions,
-                            levels,
-                            names,
-                            cache
-                                .as_mut()
-                                .map(|(table, session)| (&mut **table, &mut **session)),
-                            b,
-                        )?;
-                        expression = next.expression;
-                        path = next.path;
                         return Ok(None);
                     }
                     if matches!(
