@@ -59,12 +59,18 @@ impl Queue {
             }
             let index = found.ok_or(Stop::Unsupported)?;
             let exported = &request.recursors[index];
+            if exported.is_unsafe {
+                return Err(Stop::Unsupported);
+            }
+            // The recursor is identified by its independently derived name, so
+            // each field below is compared with the derived and rechecked
+            // recursor itself: a difference is a completed contradiction, as
+            // for non-nested blocks, not an inconclusive match.
             if exported.num_params != first.num_params
                 || exported.num_indices != expected.indices
                 || exported.num_motives != motives
                 || exported.num_minors != minors
                 || exported.k
-                || exported.is_unsafe
                 || exported.rules.len != expected.rules
                 || !parameters_equal(
                     work.names,
@@ -80,7 +86,7 @@ impl Queue {
                 )?
                 || !scheme::matches(work, expected.ty, exported.ty)?
             {
-                return Err(Stop::Unsupported);
+                return Err(Stop::Judgment(Negative::TypeMismatch));
             }
             let end = offset
                 .checked_add(expected.rules as usize)
@@ -107,13 +113,17 @@ impl Queue {
                     return Err(Stop::Unsupported);
                 }
                 // The restored rule retains the checked expanded telescope's
-                // field count. Only the same constructor supplies a negative
-                // witness; a reordered/unmatched rule remains inconclusive.
+                // field count and right-hand side. Only the same constructor
+                // supplies a negative witness; a reordered/unmatched rule
+                // remains inconclusive.
                 if expected.fields != actual.num_fields {
                     return Err(Stop::Judgment(Negative::TypeMismatch));
                 }
+                // The exact structural relation of non-nested blocks. A rule
+                // naming a constant other than the restored public ones (a
+                // retired helper, a later declaration, an alias) differs here.
                 if !scheme::matches(work, expected.rhs, actual.rhs)? {
-                    return Err(Stop::Unsupported);
+                    return Err(Stop::Judgment(Negative::TypeMismatch));
                 }
             }
             push(

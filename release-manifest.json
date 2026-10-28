@@ -85,7 +85,7 @@
     "src/check/environment/validation/inductives/fieldless/nested/queue.rs": "fd82bab9d421f676c35138d33b98a16f183eb29a33e52a1596724c71a55288d4",
     "src/check/environment/validation/inductives/fieldless/nested/queue/expanded.rs": "b47f8b96ec3417caf4b71af65cba85b5f0f2d1877555af8f64486b2d3c168e17",
     "src/check/environment/validation/inductives/fieldless/nested/queue/key.rs": "7f5c079e32cdc155d3ce83775ff53eb51151db5076b83a30cb723738a9d3f8e3",
-    "src/check/environment/validation/inductives/fieldless/nested/queue/matching.rs": "45452f4fe154ecf1bea164f598b20e184589a939e59035c09288adff8be19968",
+    "src/check/environment/validation/inductives/fieldless/nested/queue/matching.rs": "9b157bdb92822bbbcc888d78e4aba800b6f614aea2f69f40fc663633830832f8",
     "src/check/environment/validation/inductives/fieldless/nested/queue/naming.rs": "3b2c4a7bccf7b6af9028c5ced4207efa685a7516778a6fb0aa1fb2d3a4f86b18",
     "src/check/environment/validation/inductives/fieldless/nested/queue/parameters.rs": "810dc05115b746c0cd21e455402379294329662aa4ba8c7f4a74e25ea6cdd821",
     "src/check/environment/validation/inductives/fieldless/nested/queue/publication.rs": "40e048a36cc7b739601d3e554736dbdf7c87c0621f6ac225ed7334368a39fb4a",
