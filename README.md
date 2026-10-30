@@ -9,17 +9,17 @@ declarations exported by [lean4export](https://github.com/leanprover/lean4export
 (format 3.1.0) and checks every type and proof itself, including inductive types
 and their recursors, which it re-derives rather than taking from the export.
 
-![Mathlib: peak memory against instructions for every checker on the Lean Kernel Arena](images/kefir-pareto-mathlib-public-20261027-2129.png)
+![Mathlib: peak memory against instructions for every checker on the Lean Kernel Arena](images/kefir-pareto-mathlib-public-20261030-1908.png)
 
-On the [Lean Kernel Arena](https://arena.lean-lang.org) snapshot of 2026-10-27
-(arena `112b2ed3`, kefir `e05e1b0`), kefir has the lowest peak memory of any checker
+On the [Lean Kernel Arena](https://arena.lean-lang.org) snapshot of 2026-10-30
+(arena `09206c81`, kefir `d6c0194`), kefir has the lowest peak memory of any checker
 on all seven library inputs, and is on the memory–instruction Pareto frontier for
-each of them. On Reachability, a smaller application input, lazylean and pestka use
-both less memory and fewer instructions. kefir is not the fastest: on Mathlib,
-sokonanoda and mathgraph execute about 5.5× and 3.5× fewer instructions, with 2.1×
-and 2.7× kefir's peak memory.
+each of them. On Reachability, a smaller application input, lazylean uses both less
+memory and fewer instructions. kefir is not the fastest: on Mathlib, sokonanoda and
+mathgraph execute about 5.0× and 3.1× fewer instructions, with 2.2× and 2.8× kefir's
+peak memory.
 
-![Memory–instruction Pareto frontiers for the seven library inputs and Reachability](images/kefir-pareto-eight-inputs-public-20261027-2129.png)
+![Memory–instruction Pareto frontiers for the seven library inputs and Reachability](images/kefir-pareto-eight-inputs-public-20261030-1908.png)
 
 Acceptance is relative to the axioms the report lists. It does not establish that
 a theorem states the intended claim or that its assumptions are justified.
