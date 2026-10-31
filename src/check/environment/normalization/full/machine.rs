@@ -22,6 +22,7 @@ pub(crate) struct Machine {
     complete: bool,
     failure: Option<HeadError>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Machine>() == 72);
 
 impl Machine {

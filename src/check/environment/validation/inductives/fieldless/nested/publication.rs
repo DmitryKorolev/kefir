@@ -10,6 +10,7 @@ pub(super) struct Recursor {
     pub indices: u32,
     pub constructor_params: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Recursor>() == 16);
 #[derive(Default)]
 pub(super) struct Publication {
@@ -148,12 +149,12 @@ impl Publication {
         // complete. A failed cleanup drops the still-private linear token.
         let metadata_bytes = metadata
             .capacity()
-            .checked_mul(size_of::<RestoredMetadata<'_>>())
+            .checked_mul(crate::resource::charged::bytes::<RestoredMetadata<'_>>())
             .ok_or(ResourceError::Counter)?;
         drop(metadata);
         let rules_bytes = rules
             .capacity()
-            .checked_mul(size_of::<NullaryRule>())
+            .checked_mul(crate::resource::charged::bytes::<NullaryRule>())
             .ok_or(ResourceError::Counter)?;
         drop(rules);
         budget.release(metadata_bytes as u64)?;
@@ -167,11 +168,16 @@ impl Publication {
                 n.checked_add(
                     self.recursors
                         .capacity()
-                        .checked_mul(size_of::<Recursor>())?,
+                        .checked_mul(crate::resource::charged::bytes::<Recursor>())?,
                 )
             })
             .ok_or(ResourceError::Counter)?;
         drop(self);
         budget.release(bytes as u64)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Recursor => 16,
 }

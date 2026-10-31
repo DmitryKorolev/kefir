@@ -134,11 +134,11 @@ impl Working<'_> {
         })();
         let bytes = arguments
             .capacity()
-            .checked_mul(size_of::<ExprId>())
+            .checked_mul(crate::resource::charged::bytes::<ExprId>())
             .ok_or(ResourceError::Counter)?;
         let universe_bytes = universes
             .capacity()
-            .checked_mul(size_of::<LevelId>())
+            .checked_mul(crate::resource::charged::bytes::<LevelId>())
             .ok_or(ResourceError::Counter)?;
         drop(arguments);
         drop(universes);
@@ -263,7 +263,7 @@ impl Working<'_> {
             Visit(ExprId, u32),
             Finish(ExprId, u32),
         }
-        const _: () = assert!(size_of::<Occurrence>() == 12);
+        crate::resource::charged::charged! { Occurrence => 12 }
 
         fn add(
             work: &mut Working<'_>,
@@ -342,7 +342,7 @@ impl Working<'_> {
         let remaining = stack.len();
         let bytes = stack
             .capacity()
-            .checked_mul(size_of::<Occurrence>())
+            .checked_mul(crate::resource::charged::bytes::<Occurrence>())
             .ok_or(ResourceError::Counter)?;
         drop(stack);
         let frames = self.budget.release_frames(remaining);

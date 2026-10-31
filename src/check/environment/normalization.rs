@@ -13,6 +13,7 @@ use crate::syntax::expressions::{
 use crate::syntax::levels::{LevelId, LevelNames, Levels, NameId};
 use crate::syntax::local_context::LocalContext;
 use crate::syntax::names::Names;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 /// Fixed validated environment or private checked-signature phase, with original
@@ -29,6 +30,7 @@ pub(crate) struct Scope<'a> {
     pub level_end: usize,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Scope<'_>>() == 56);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +80,7 @@ impl TypeObservation {
         self.incoming
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<TypeObservation>() == 8);
 
 /// Evaluation permission belongs to the live head judgment. It is restored when
@@ -96,6 +99,7 @@ struct Application {
     function: ExprId,
     argument: ExprId,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Application>() == 12);
 impl Application {
     /// Ordinary immutable application edges precede their parent. Equal handles
@@ -148,6 +152,7 @@ struct Iota {
     kind: Suspension,
     exposure: Exposure,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Iota>() == 24);
 
 impl Iota {
@@ -298,10 +303,13 @@ impl Scratch {
         a.and(c).and(e).and(f).and(d)
     }
 }
-fn release<T: Copy>(values: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: Copy + crate::resource::charged::Charged>(
+    values: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(values);
     b.release(bytes as u64)
@@ -405,4 +413,10 @@ impl Scope<'_> {
         machine.retire(b)?;
         result
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Application => 12,
+    Iota => 24,
 }

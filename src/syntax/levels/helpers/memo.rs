@@ -16,6 +16,7 @@
 //! event or export surface exists.
 use crate::resource::{Budget, ResourceError, SessionCacheBudget};
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
@@ -24,6 +25,7 @@ struct Entry {
     value: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 12);
 
 /// Exact u32-key table of completed N(source) results, mirroring the private
@@ -36,6 +38,7 @@ pub(crate) struct SharedMemo {
     used: usize,
     stopped: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SharedMemo>() == 40);
 
 /// The borrowed table plus the session cache ledger that owns its capacity.
@@ -143,7 +146,7 @@ impl SharedMemo {
             .ok_or(ResourceError::Counter)?
             .max(16);
         let bytes = cap
-            .checked_mul(size_of::<Entry>())
+            .checked_mul(crate::resource::charged::bytes::<Entry>())
             .ok_or(ResourceError::Counter)? as u64;
         // No allocation or semantic reservation until BOTH complete peak checks
         // pass. Old table capacity remains charged throughout replacement.
@@ -190,10 +193,15 @@ fn release(
 ) -> Result<(), ResourceError> {
     let bytes = entries
         .capacity()
-        .checked_mul(size_of::<Entry>())
+        .checked_mul(crate::resource::charged::bytes::<Entry>())
         .ok_or(ResourceError::Counter)? as u64;
     drop(entries);
     let a = session.release(bytes);
     let c = b.release(bytes);
     a.and(c)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 12,
 }

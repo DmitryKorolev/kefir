@@ -7,6 +7,7 @@ use crate::syntax::expressions::{ExprId, ExprKind};
 use crate::syntax::levels::{
     LevelId, LevelKind, LevelNames, Levels, NameId, SharedTable, UniverseComparison,
 };
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,7 +15,9 @@ enum Pair {
     Expression(ExprId, ExprId),
     Level(LevelId, LevelId),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Pair>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<Pair>>() == 12);
 
 mod reuse;
@@ -483,4 +486,10 @@ fn universe_obligation(
         UniverseComparison::Equal => Ok(()),
         UniverseComparison::NotEqual => Err(HeadError::Unsupported),
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Pair => 12,
+    Option<Pair> => 12,
 }

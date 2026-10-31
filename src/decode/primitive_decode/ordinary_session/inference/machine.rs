@@ -37,8 +37,10 @@ pub(super) struct Machine {
     failure_view: Option<View>,
 }
 #[cfg(not(feature = "introspection"))]
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Machine>() == 192);
 #[cfg(feature = "introspection")]
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Machine>() == 208);
 
 impl Machine {
@@ -972,7 +974,7 @@ impl Machine {
         let bytes = self
             .frames
             .capacity()
-            .checked_mul(size_of::<Frame>())
+            .checked_mul(crate::resource::charged::bytes::<Frame>())
             .ok_or(ResourceError::Counter);
         drop(self.frames);
         let cache_error = self.memo.retire(caches, b).err().map(Stop::Resource);

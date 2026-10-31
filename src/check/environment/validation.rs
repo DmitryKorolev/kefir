@@ -11,6 +11,7 @@ use crate::resource::{
     Budget, Event, ReductionPath, ResourceError,
     failure::{FailureOutcome, FailureReport},
 };
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 mod inductives;
@@ -29,6 +30,7 @@ pub(crate) struct State {
     failure: Option<FailureReport>,
 }
 // Declaration entries remain unchanged.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<State>() == 856 + size_of::<theorem_judgments::Judgments>());
 fn unsupported() -> FailureReport {
     FailureReport {

@@ -247,6 +247,7 @@ pub(crate) struct Working<'a> {
     // operation/owned-work cause or allow a completed negative through cleanup.
     owned_cleanup: Option<ResourceError>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Working<'_>>() <= 96);
 impl Working<'_> {
     /// Runs `f` with the pre-staging Sort authority. Only the

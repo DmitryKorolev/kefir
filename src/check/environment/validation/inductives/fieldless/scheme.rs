@@ -36,8 +36,11 @@ struct FieldSpan {
     start: u32,
     len: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Binder>() == 20);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Field>() == 44);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<FieldSpan>() == 8);
 #[derive(Clone, Copy)]
 struct FamilyTelescope {
@@ -48,6 +51,7 @@ struct FamilyTelescope {
     constructors: FieldSpan,
     results: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<FamilyTelescope>() == 32);
 
 #[derive(Default)]
@@ -71,8 +75,13 @@ pub(super) struct Scratch {
     pub result: Option<LevelId>,
 }
 // Nine flat buffers, two optional levels and scalar telescope summaries.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Scratch>() == 280);
-pub(super) fn push<T>(work: &mut Working<'_>, v: &mut Vec<T>, x: T) -> Result<(), Stop> {
+pub(super) fn push<T: crate::resource::charged::Charged>(
+    work: &mut Working<'_>,
+    v: &mut Vec<T>,
+    x: T,
+) -> Result<(), Stop> {
     let n = v.len().checked_add(1).ok_or(ResourceError::Counter)?;
     work.budget.grow_vec(v, n)?;
     v.push(x);
@@ -183,7 +192,7 @@ fn close_by(
         }
         Ok::<_, Stop>(body)
     })();
-    let bytes = ids.capacity() * std::mem::size_of::<u32>();
+    let bytes = ids.capacity() * crate::resource::charged::bytes::<u32>();
     drop(ids);
     work.budget.release(bytes as u64)?;
     result
@@ -236,15 +245,15 @@ impl Scratch {
         } else {
             Ok(())
         };
-        let bytes = self.binders.capacity() * std::mem::size_of::<Binder>()
-            + self.families.capacity() * std::mem::size_of::<FamilyTelescope>()
+        let bytes = self.binders.capacity() * crate::resource::charged::bytes::<Binder>()
+            + self.families.capacity() * crate::resource::charged::bytes::<FamilyTelescope>()
             + self.universes.capacity() * 4
             + self.constructors.capacity() * 4
             + self.results.capacity() * 4
-            + self.fields.capacity() * std::mem::size_of::<Field>()
-            + self.field_spans.capacity() * std::mem::size_of::<FieldSpan>()
+            + self.fields.capacity() * crate::resource::charged::bytes::<Field>()
+            + self.field_spans.capacity() * crate::resource::charged::bytes::<FieldSpan>()
             + self.recursive_indices.capacity() * 4
-            + self.recursive_binders.capacity() * std::mem::size_of::<Binder>();
+            + self.recursive_binders.capacity() * crate::resource::charged::bytes::<Binder>();
         let family_set = std::mem::take(&mut self.family_set);
         drop(self);
         let membership = family_set.retire(work.budget);
@@ -1007,7 +1016,7 @@ impl Scratch {
                 Ok::<_, Stop>(())
             })();
             let bytes = universes.capacity() * 4
-                + prefixes.capacity() * std::mem::size_of::<Option<ExprId>>();
+                + prefixes.capacity() * crate::resource::charged::bytes::<Option<ExprId>>();
             drop(universes);
             drop(prefixes);
             work.budget.release(bytes as u64)?;
@@ -1121,4 +1130,12 @@ pub(super) fn completed_neutral_family(
     } else {
         NeutralFamily::NotProven
     })
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    FieldSpan => 8,
+    Field => 44,
+    FamilyTelescope => 32,
+    Binder => 20,
 }

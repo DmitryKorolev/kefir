@@ -38,6 +38,7 @@ pub(in super::super) struct Primitive {
     changed: bool,
     phase: Phase,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Primitive>() <= 80);
 
 impl Primitive {

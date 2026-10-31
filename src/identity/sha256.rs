@@ -12,6 +12,7 @@ pub(crate) struct Sha256 {
     used: u8,
     failed: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Sha256>() <= 120);
 impl Sha256 {
     pub(crate) fn new() -> Self {

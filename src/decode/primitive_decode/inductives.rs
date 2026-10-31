@@ -73,10 +73,15 @@ pub(super) struct Payload {
 // per-member allocation: 48/36/52/12 bytes, name entries 4 bytes, pending numeric
 // token fixups at most 32 bytes each until validation. Capacity, including growth
 // overlap, is charged by grow_vec; fixed capture holds at most two builders.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Inductive>() == 48);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Constructor>() == 36);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Recursor>() == 52);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Rule>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<NameId>() == 4);
 impl Payload {
     pub(super) fn request(&self) -> Request<'_> {
@@ -96,12 +101,20 @@ impl Payload {
         self.names.clear();
     }
     pub(super) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
-        let bytes = self.types.capacity() * size_of::<Inductive>()
-            + self.constructors.capacity() * size_of::<Constructor>()
-            + self.recursors.capacity() * size_of::<Recursor>()
-            + self.rules.capacity() * size_of::<Rule>()
-            + self.names.capacity() * size_of::<NameId>();
+        let bytes = self.types.capacity() * crate::resource::charged::bytes::<Inductive>()
+            + self.constructors.capacity() * crate::resource::charged::bytes::<Constructor>()
+            + self.recursors.capacity() * crate::resource::charged::bytes::<Recursor>()
+            + self.rules.capacity() * crate::resource::charged::bytes::<Rule>()
+            + self.names.capacity() * crate::resource::charged::bytes::<NameId>();
         drop(self);
         b.release(bytes as u64)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Inductive => 48,
+    Constructor => 36,
+    Recursor => 52,
+    Rule => 12,
 }

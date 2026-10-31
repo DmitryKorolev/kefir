@@ -25,13 +25,18 @@ struct Name {
     parent: u32,
     component: &'static str,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Expression>() == 16 && size_of::<Level>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Declaration>() == 32 && size_of::<Rule>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<LetPayload>() == 20);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Name>() == 24);
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Certificate([u32; 10]);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Certificate>() == 40);
 // Slots are original committed declaration identities, not canonical name IDs.
 // The mask belongs to one growing immutable Environment. No theorem transport,

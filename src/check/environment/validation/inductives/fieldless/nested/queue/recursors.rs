@@ -18,7 +18,9 @@ pub(super) struct Rule {
     pub rhs: ExprId,
     pub ty: ExprId,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Recursor>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Rule>() == 16);
 #[derive(Default)]
 pub(super) struct Derived {
@@ -270,4 +272,10 @@ pub(super) fn derive(
     })();
     release(members, work.budget)?;
     result
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Rule => 16,
+    Recursor => 16,
 }

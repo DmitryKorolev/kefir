@@ -23,6 +23,7 @@ enum Pending {
         constructor: ExprId,
     },
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Pending>() == 16);
 
 pub(crate) struct Machine {
@@ -41,6 +42,7 @@ pub(crate) struct Machine {
 }
 // 96-byte vector owners plus root/path, pending judgment and sticky state. No imported
 // node or declaration entry grows; one current head owns this stack value.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Machine>() == 136);
 
 impl Machine {

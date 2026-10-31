@@ -35,6 +35,7 @@ use crate::syntax::local_context::LocalContext;
 use crate::syntax::names::Names;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 use std::num::NonZeroU32;
 
@@ -82,7 +83,10 @@ const MEMO_DENSE: usize = 1 << 21;
 trait Resettable {
     fn reset_table(&mut self);
 }
-impl<K: LossyKey, V: Copy> Resettable for Lossy<K, V> {
+impl<K: LossyKey, V: Copy> Resettable for Lossy<K, V>
+where
+    Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
+{
     fn reset_table(&mut self) {
         self.reset();
     }
@@ -151,10 +155,13 @@ impl<K: LossyKey, V: Copy> Default for Lossy<K, V> {
         }
     }
 }
-impl<K: LossyKey, V: Copy> Lossy<K, V> {
+impl<K: LossyKey, V: Copy> Lossy<K, V>
+where
+    Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
+{
     // Charge the adopted packed bucket representation. Logical live slots,
     // rather than allocator slack kept across attempts, decide reservations.
-    const SLOT: usize = size_of::<Option<(NonZeroU32, K, V)>>();
+    const SLOT: usize = crate::resource::charged::bytes::<Option<(NonZeroU32, K, V)>>();
     #[inline]
     fn index(&self, k: &K, size: usize) -> usize {
         Self::key_hash(k) & (size - 1)
@@ -357,7 +364,7 @@ impl Resettable for Exact {
     }
 }
 impl Exact {
-    const SLOT: usize = size_of::<MemoSlot>();
+    const SLOT: usize = crate::resource::charged::bytes::<MemoSlot>();
     /// Entries at which a table of `size` slots doubles: always below `size`,
     /// so a vacancy remains for migration and probing.
     #[inline]
@@ -519,7 +526,12 @@ fn logical(n: usize) -> usize {
 /// kept from earlier attempts is reused. Copying on growth is not charged as
 /// work: it is bounded by twice the reserved storage.
 #[inline]
-fn room<T>(b: &mut Budget, reserved: &mut u64, v: &mut Vec<T>, extra: usize) -> R<()> {
+fn room<T: crate::resource::charged::Charged>(
+    b: &mut Budget,
+    reserved: &mut u64,
+    v: &mut Vec<T>,
+    extra: usize,
+) -> R<()> {
     let n = v.len();
     // Only an empty store or a power-of-two length can cross a logical step.
     if extra == 1 && n != 0 && (n < 4 || !n.is_power_of_two()) && v.capacity() > n {
@@ -528,11 +540,20 @@ fn room<T>(b: &mut Budget, reserved: &mut u64, v: &mut Vec<T>, extra: usize) -> 
     room_slow(b, reserved, v, extra)
 }
 #[cold]
-fn room_slow<T>(b: &mut Budget, reserved: &mut u64, v: &mut Vec<T>, extra: usize) -> R<()> {
+fn room_slow<T: crate::resource::charged::Charged>(
+    b: &mut Budget,
+    reserved: &mut u64,
+    v: &mut Vec<T>,
+    extra: usize,
+) -> R<()> {
     let (now, next) = (logical(v.len()), logical(v.len() + extra));
     if next > now || v.is_empty() {
         let from = if v.is_empty() { 0 } else { now };
-        charge_bytes(b, reserved, (next - from) * size_of::<T>())?;
+        charge_bytes(
+            b,
+            reserved,
+            (next - from) * crate::resource::charged::bytes::<T>(),
+        )?;
     }
     if v.capacity() - v.len() < extra {
         v.try_reserve_exact(next - v.len())
@@ -561,8 +582,11 @@ fn copied<T: Copy>(s: &[T]) -> R<Vec<T>> {
 }
 /// Bytes charged for a hash table able to hold `capacity` entries (at most
 /// two buckets per entry, one control byte each, plus a group of slack).
-fn map_bytes<K, V>(capacity: usize) -> usize {
-    2 * capacity * (size_of::<(K, V)>() + 1) + 16
+fn map_bytes<K, V>(capacity: usize) -> usize
+where
+    (K, V): crate::resource::charged::Charged,
+{
+    2 * capacity * (crate::resource::charged::bytes::<(K, V)>() + 1) + 16
 }
 /// Insert into an exact table, growing it fallibly with storage reserved first.
 fn map_put<K: std::hash::Hash + Eq, V>(
@@ -571,7 +595,10 @@ fn map_put<K: std::hash::Hash + Eq, V>(
     m: &mut Map<K, V>,
     k: K,
     v: V,
-) -> R<()> {
+) -> R<()>
+where
+    (K, V): crate::resource::charged::Charged,
+{
     let n = m.len();
     if n != 0 && (n < 4 || !n.is_power_of_two()) && n < m.capacity() {
         m.insert(k, v);
@@ -628,7 +655,11 @@ const LEVEL_ARGS: usize = 16;
 /// Optional attempt limits: exceeding either ends this attempt only.
 const MAX_DEPTH: u32 = 400_000;
 /// Stack reserved for the checking thread (`Run::check`).
+#[cfg(not(target_family = "wasm"))]
 pub(crate) const CHECK_STACK: usize = 2 << 30;
+/// wasm32: the linear-memory stack, passed to the linker by `build.rs`.
+#[cfg(target_family = "wasm")]
+pub(crate) const CHECK_STACK: usize = crate::resource::wasm_layout::STACK_BYTES as usize;
 /// Stack the kernel may use below its thread's base before an attempt ends:
 /// the reservation less a margin for the frames between checks.
 const STACK_BUDGET: usize = CHECK_STACK - (64 << 20);
@@ -964,15 +995,6 @@ enum NatLit {
     /// Canonical decimal digits of a value above `u64::MAX`.
     Big(Vec<u8>),
 }
-impl NatLit {
-    /// A fallible copy (big literals own their digits).
-    fn dup(&self) -> R<Self> {
-        Ok(match self {
-            Self::Small(v) => Self::Small(*v),
-            Self::Big(b) => Self::Big(copied(b)?),
-        })
-    }
-}
 
 /// Capacity reused across declaration attempts on one thread. Contents are
 /// always cleared before reuse: no value, environment or cache entry survives
@@ -1265,7 +1287,11 @@ impl<'e, 'w> Kernel<'e, 'w> {
     fn init(&mut self) -> R<()> {
         // A fixed upper bound for the existing optional 64-entry pool itself.
         // Buffer payloads have separate live reservations, including in-pool.
-        charge_bytes(self.b, &mut self.reserved, 64 * size_of::<Scratch>())?;
+        charge_bytes(
+            self.b,
+            &mut self.reserved,
+            64 * crate::resource::charged::bytes::<Scratch>(),
+        )?;
         room(self.b, &mut self.reserved, &mut self.cells, 1)?;
         self.cells.push(Cell {
             prev: 0,
@@ -1401,15 +1427,18 @@ impl<'e, 'w> Kernel<'e, 'w> {
         // charged to later attempts, so it stays a fixed per-thread amount
         // (at most `RETAIN` bytes per store; 16 stores, two buffers per lossy
         // table, so under 8 MiB). Larger stores are freed now.
-        fn vec<T>(v: &mut Vec<T>) -> Vec<T> {
+        fn vec<T: crate::resource::charged::Charged>(v: &mut Vec<T>) -> Vec<T> {
             let v = std::mem::take(v);
-            if v.capacity() * size_of::<T>() <= RETAIN {
+            if v.capacity() * crate::resource::charged::bytes::<T>() <= RETAIN {
                 v
             } else {
                 Vec::new()
             }
         }
-        fn map<K, V>(m: &mut Map<K, V>) -> Map<K, V> {
+        fn map<K, V>(m: &mut Map<K, V>) -> Map<K, V>
+        where
+            (K, V): crate::resource::charged::Charged,
+        {
             let m = std::mem::take(m);
             if map_bytes::<K, V>(m.capacity()) <= RETAIN {
                 m
@@ -1417,7 +1446,10 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 Map::default()
             }
         }
-        fn lossy<K: LossyKey, V: Copy>(t: &mut Lossy<K, V>) -> Lossy<K, V> {
+        fn lossy<K: LossyKey, V: Copy>(t: &mut Lossy<K, V>) -> Lossy<K, V>
+        where
+            Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
+        {
             let t = std::mem::take(t);
             if t.held() <= 2 * RETAIN {
                 t
@@ -1854,9 +1886,9 @@ impl<'e, 'w> Kernel<'e, 'w> {
             .checked_next_power_of_two()
             .ok_or(ResourceError::Counter)?;
         let bytes = slots
-            .checked_mul(size_of::<u32>())
+            .checked_mul(crate::resource::charged::bytes::<u32>())
             .ok_or(ResourceError::Counter)?;
-        let old = (v.slots * size_of::<u32>()) as u64;
+        let old = (v.slots * crate::resource::charged::bytes::<u32>()) as u64;
         charge_bytes(self.b, &mut self.reserved, bytes)?;
         if v.capacity() < slots {
             let extra = slots - v.len();
@@ -1899,7 +1931,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             self.scratch.push(v);
             return Ok(());
         }
-        let bytes = (v.slots * size_of::<u32>()) as u64;
+        let bytes = (v.slots * crate::resource::charged::bytes::<u32>()) as u64;
         drop(v);
         let remaining = self
             .reserved
@@ -1985,8 +2017,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
         self.locals.push(ty);
         self.push(Val::Local { id, spine: 0 })
     }
-    /// Every retained Big payload comes from reserved `parse_nat` construction.
-    /// `NatLit::dup` is temporary and must never be installed here. The byte
+    /// Every retained Big payload comes from reserved `parse_nat` or `nat_pred` construction.
+    /// Operand observations borrow this append-only store. The byte
     /// reservation remains in `self.reserved` until this attempt retires.
     fn nat(&mut self, n: NatLit) -> R<u32> {
         let id = self.nats.len() as u32;
@@ -3292,18 +3324,20 @@ impl<'e, 'w> Kernel<'e, 'w> {
     /// A natural literal for `v`. Inside `lazy_delta` (`lazy`), a let-bound
     /// operand is reduced only within `LET_FOLD_BUDGET`; past it there is no
     /// literal, and lazy delta continues by unfolding.
-    fn nat_value_in(&mut self, v: u32, lazy: bool) -> R<Option<NatLit>> {
+    /// Returns an append-only literal-store ID; NONE denotes canonical zero.
+    /// Hold IDs, never copied digit buffers, across recursive normalization.
+    fn nat_value_in(&mut self, v: u32, lazy: bool) -> R<Option<u32>> {
         if lazy && !self.let_fold_allowed(v)? {
             return Ok(None);
         }
         let w = self.whnf(v)?;
         match self.vals[w as usize] {
-            Val::Nat(n) => Ok(Some(self.nats[n as usize].dup()?)),
+            Val::Nat(n) => Ok(Some(n)),
             Val::Const { ci, spine: 0, .. } => {
                 if let Some((_, zero, _)) = self.nat_ctors()?
                     && ci == zero
                 {
-                    return Ok(Some(NatLit::Small(0)));
+                    return Ok(Some(NONE));
                 }
                 Ok(None)
             }
@@ -3427,11 +3461,11 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 return Ok(None);
             }
             if let Some(x) = self.nat_value_in(arg, lazy)? {
-                let next = match x {
-                    NatLit::Small(n) if n < u64::MAX => NatLit::Small(n + 1),
+                let next = match nat_literal(&self.nats, x) {
+                    NatLit::Small(n) if *n < u64::MAX => NatLit::Small(n + 1),
                     other => {
-                        let d = nat_digits(&other)?;
-                        match crate::check::natural::successor(&d, self.b) {
+                        let d = nat_digits(other);
+                        match crate::check::natural::successor(d.as_bytes(), self.b) {
                             Ok(d) => {
                                 let lit = parse_nat(d.as_bytes(), self.b, &mut self.reserved);
                                 d.retire(self.b)?;
@@ -3472,11 +3506,17 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let Some(y) = self.nat_value_in(c, lazy)? else {
             return Ok(None);
         };
+        // Both recursive observations are complete before borrowing digits.
+        // Literal entries are immutable and cannot retire within this attempt.
         let Some(op) = op else {
             let equality = pred == Some(true);
-            let (xs, ys) = (nat_digits(&x)?, nat_digits(&y)?);
+            let (xs, ys) = (
+                nat_digits(nat_literal(&self.nats, x)),
+                nat_digits(nat_literal(&self.nats, y)),
+            );
+            let (xs, ys) = (xs.as_bytes(), ys.as_bytes());
             self.b.charge_work((xs.len() + ys.len() + 4) as u64)?;
-            let order = xs.len().cmp(&ys.len()).then_with(|| xs.cmp(&ys));
+            let order = xs.len().cmp(&ys.len()).then_with(|| xs.cmp(ys));
             let answer = if equality {
                 order.is_eq()
             } else {
@@ -3496,11 +3536,12 @@ impl<'e, 'w> Kernel<'e, 'w> {
         if op == crate::check::natural::Operation::Gcd {
             self.steps_by(129)?;
         }
-        let r = match nat_small(op, &x, &y) {
+        let (x, y) = (nat_literal(&self.nats, x), nat_literal(&self.nats, y));
+        let r = match nat_small(op, x, y) {
             Some(r) => NatLit::Small(r),
             None => {
-                let (xs, ys) = (nat_digits(&x)?, nat_digits(&y)?);
-                match crate::check::natural::arithmetic(op, &xs, &ys, self.b) {
+                let (xs, ys) = (nat_digits(x), nat_digits(y));
+                match crate::check::natural::arithmetic(op, xs.as_bytes(), ys.as_bytes(), self.b) {
                     Ok(d) => {
                         let lit = parse_nat(d.as_bytes(), self.b, &mut self.reserved);
                         d.retire(self.b)?;
@@ -3642,14 +3683,14 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 && let Some((nat, zero, succ)) = self.nat_ctors()?
                 && self.const_view(nat)?.canon == rec.family
             {
-                major = match self.nats[n as usize].dup()? {
+                major = match &self.nats[n as usize] {
                     NatLit::Small(0) => self.push(Val::Const {
                         ci: zero,
                         li: 0,
                         spine: 0,
                     })?,
                     lit => {
-                        let pred = nat_pred(&lit, self.b, &mut self.reserved)?;
+                        let pred = nat_pred(lit, self.b, &mut self.reserved)?;
                         let pred = self.nat(pred)?;
                         let spine = self.cell(0, pred, 0)?;
                         self.push(Val::Const {
@@ -6250,7 +6291,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let Val::Const { ci, spine, .. } = self.vals[other as usize] else {
             return Ok(false);
         };
-        let lit = self.nats[n as usize].dup()?;
+        let lit = &self.nats[n as usize];
         if ci == zero && spine == 0 {
             return Ok(matches!(lit, NatLit::Small(0)));
         }
@@ -6258,7 +6299,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             let Some(arg) = self.arg_item(spine) else {
                 return Ok(false);
             };
-            let p = nat_pred(&lit, self.b, &mut self.reserved)?;
+            let p = nat_pred(lit, self.b, &mut self.reserved)?;
             let p = self.nat(p)?;
             return self.defeq(p, arg);
         }
@@ -6397,25 +6438,48 @@ fn parse_nat(bytes: &[u8], b: &mut Budget, reserved: &mut u64) -> R<NatLit> {
     }
     Ok(NatLit::Small(n))
 }
-fn nat_digits(n: &NatLit) -> R<Vec<u8>> {
+/// NONE is the zero constructor; other IDs come only from nat_value_in.
+/// The literal store is append-only throughout operand observation.
+fn nat_literal(nats: &[NatLit], id: u32) -> &NatLit {
+    if id == NONE {
+        &NatLit::Small(0)
+    } else {
+        &nats[id as usize]
+    }
+}
+/// Fixed stack formatting for machine operands; large digits stay borrowed.
+enum NatDigits<'a> {
+    Small { bytes: [u8; 20], start: usize },
+    Big(&'a [u8]),
+}
+impl NatDigits<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Small { bytes, start } => &bytes[*start..],
+            Self::Big(bytes) => bytes,
+        }
+    }
+}
+fn nat_digits(n: &NatLit) -> NatDigits<'_> {
     match n {
         NatLit::Small(v) => {
-            let mut buf = [0u8; 20];
-            let mut i = buf.len();
+            let mut bytes = [0u8; 20];
+            let mut start = bytes.len();
             let mut v = *v;
             loop {
-                i -= 1;
-                buf[i] = b'0' + (v % 10) as u8;
+                start -= 1;
+                bytes[start] = b'0' + (v % 10) as u8;
                 v /= 10;
                 if v == 0 {
                     break;
                 }
             }
-            copied(&buf[i..])
+            NatDigits::Small { bytes, start }
         }
-        NatLit::Big(b) => copied(b),
+        NatLit::Big(bytes) => NatDigits::Big(bytes),
     }
 }
+
 fn nat_eq(a: &NatLit, c: &NatLit) -> bool {
     match (a, c) {
         (NatLit::Small(x), NatLit::Small(y)) => x == y,
@@ -6426,23 +6490,32 @@ fn nat_eq(a: &NatLit, c: &NatLit) -> bool {
 fn nat_pred(n: &NatLit, budget: &mut Budget, reserved: &mut u64) -> R<NatLit> {
     match n {
         NatLit::Small(v) => Ok(NatLit::Small(v - 1)),
-        NatLit::Big(b) => {
-            let mut d = copied(b)?;
-            let mut i = d.len();
+        // This is the sole canonical big input whose predecessor is small.
+        NatLit::Big(bytes) if bytes == b"18446744073709551616" => Ok(NatLit::Small(u64::MAX)),
+        NatLit::Big(bytes) => {
+            // The only owned buffer is the retained result. Reserve its actual
+            // capacity before copying; failures retain ownership until rollback.
+            charge_bytes(budget, reserved, bytes.len())?;
+            let mut digits = copied(bytes)?;
+            let mut i = digits.len();
             while i > 0 {
                 i -= 1;
-                if d[i] == b'0' {
-                    d[i] = b'9';
+                if digits[i] == b'0' {
+                    digits[i] = b'9';
                 } else {
-                    d[i] -= 1;
+                    digits[i] -= 1;
                     break;
                 }
             }
-            let start = d.iter().position(|&x| x != b'0').unwrap_or(d.len() - 1);
-            parse_nat(&d[start..], budget, reserved)
+            if digits[0] == b'0' {
+                digits.remove(0);
+            }
+            // Removing a leading zero does not shrink capacity or its charge.
+            Ok(NatLit::Big(digits))
         }
     }
 }
+
 fn nat_small(op: crate::check::natural::Operation, a: &NatLit, c: &NatLit) -> Option<u64> {
     use crate::check::natural::Operation::*;
     let (NatLit::Small(x), NatLit::Small(y)) = (a, c) else {
@@ -6829,3 +6902,36 @@ fn finish_attempt(
 }
 
 mod read_wide;
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    ConstantSlot => 12,
+    NatLit => 24,
+    LInst => 16,
+    ((u32, u32, u32, [u32; 8], [u32; 8]), (u32, [u32; 8])) => 112,
+    ((u32, u32, u32, u32), u32) => 20,
+    ((u32, [u32; 8], [u32; 8]), u32) => 72,
+    ((u32, u64, u32), u32) => 24,
+    (u32, u64) => 16,
+    (u64, u32) => 16,
+    ((u32, u32), bool) => 12,
+    (u32, LevelId) => 8,
+    ((u8, u32, u32), LevelId) => 16,
+    ((u32, u32), LevelId) => 12,
+    ((u64, [u32; 16]), u32) => 80,
+    ((u32, u32), u32) => 12,
+    ((u32, u32, u32), (u32, bool)) => 20,
+    ((u32, u32, u32), u32) => 16,
+    EnvNode => 12,
+    Cell => 16,
+    Meta => 16,
+    Val => 20,
+    Option<(NonZeroU32, (u32, u32, u32, u32, u32, u32), u32)> => 32,
+    Option<(NonZeroU32, (u32, u32, u32, u32, u32, u32), ())> => 28,
+    Option<(NonZeroU32, (u32, u32, u32), u32)> => 20,
+    Option<(NonZeroU32, (u32, u32, u32, u32, u32), u32)> => 28,
+    Option<(NonZeroU32, (u32, u32), ())> => 12,
+    Option<(NonZeroU32, EnvKey, u32)> => 16,
+    CInfo<'_> => 144,
+    MemoSlot => 20,
+}

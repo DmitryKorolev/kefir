@@ -3,9 +3,11 @@ use crate::resource::{Budget, ResourceError, failure::FailureOutcome};
 use crate::syntax::expressions::{ExprId, ExprKind, Expressions};
 use crate::syntax::levels::Levels;
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 type Pair = (ExprId, ExprId);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Pair>() == 8);
 
 #[derive(Clone, Copy, Default)]
@@ -14,6 +16,7 @@ struct Entry {
     right: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 12);
 
 #[derive(Default)]
@@ -99,10 +102,13 @@ impl Seen {
     }
 }
 
-fn release<T: Copy>(values: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: Copy + crate::resource::charged::Charged>(
+    values: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(values);
     b.release(bytes as u64)
@@ -229,4 +235,9 @@ pub(super) fn same(
         Some(error) => Err(error),
         None => result,
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 12,
 }

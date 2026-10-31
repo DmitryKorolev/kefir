@@ -13,6 +13,7 @@ pub(super) struct Certificate {
     slots: [u32; 6],
     frontiers: [u32; 6],
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Certificate>() == 160);
 const _: () = assert!(manifest::PIN_CLOSURE_MASKS.len() == 2);
 impl Certificate {

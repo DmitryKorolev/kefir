@@ -14,6 +14,7 @@ enum Frame {
     Visit(ExprId),
     Finish(ExprId),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() == 8);
 pub(crate) struct ExpressionSubstitution<'e, 's, 'h, 'a, N, const CACHED: bool = true> {
     expressions: &'e mut Expressions,
@@ -356,4 +357,9 @@ impl<N: LevelNames, const CACHED: bool> ExpressionSubstitution<'_, '_, '_, '_, N
         }
         Ok(result)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 8,
 }

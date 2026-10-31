@@ -10,6 +10,7 @@ pub(super) struct Attempt {
     pub right: Head,
     paired: paired::State,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Attempt>() == 28);
 
 pub(super) enum Preparation {

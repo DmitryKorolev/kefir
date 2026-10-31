@@ -53,6 +53,7 @@ impl InputFindings {
         self.0 == 0
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<InputFindings>() == 1);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StopReason {
@@ -83,6 +84,7 @@ pub(crate) struct Facts {
     /// It cannot be serialized as the final result without precedence selection.
     pub stop: Option<StopReason>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Facts>() <= 48);
 impl Facts {
     /// Select only among recorded terminal decoder causes. The fixed input order

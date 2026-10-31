@@ -7,6 +7,7 @@ use crate::syntax::expressions::{
 };
 use crate::syntax::levels::Levels;
 use crate::syntax::names::Names;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 pub(crate) const LIMIT: usize = 8;
@@ -19,11 +20,13 @@ struct Entry {
     len: u8,
     state: u8, // 0 empty; 1 closed key seen; 2 completed beta prefix.
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 44);
 #[derive(Default)]
 pub(super) struct Cache {
     entries: Vec<Entry>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Cache>() == 24);
 impl Cache {
     /// Caller has revalidated the rule and supplies the full fixed prefix in
@@ -81,7 +84,7 @@ impl Cache {
                 }
             }
             if self.entries.is_empty() {
-                let bytes = (SLOTS * size_of::<Entry>()) as u64;
+                let bytes = (SLOTS * crate::resource::charged::bytes::<Entry>()) as u64;
                 // Probe optional admission, then undo the probe: allocate below
                 // owns the actual session reservation and storage charge.
                 if !b.has_storage_headroom(bytes) || !session.reserve(bytes)? {
@@ -131,4 +134,9 @@ impl Cache {
     ) -> Result<(), ResourceError> {
         release(self.entries, session, b)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 44,
 }

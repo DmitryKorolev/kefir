@@ -2,7 +2,9 @@
 use super::*;
 
 pub(super) type RepresentativeKey = ([u64; 4], [u32; 16]);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Map<RepresentativeKey, u32>>() <= 64);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<(RepresentativeKey, u32)>() <= 104);
 
 impl Kernel<'_, '_> {
@@ -97,4 +99,9 @@ impl Kernel<'_, '_> {
             env,
         )
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    (([u64; 4], [u32; 16]), u32) => 104,
 }

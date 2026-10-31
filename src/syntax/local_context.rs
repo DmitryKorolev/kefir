@@ -2,6 +2,7 @@
 use crate::resource::{Budget, CONTEXT_DEPTH, ResourceError};
 use crate::syntax::expressions::{BinderInfo, ExprId, Expressions};
 use crate::syntax::levels::{LevelNames, NameId};
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 /// Monotone within one declaration. Never mix context/declaration origins.
@@ -20,6 +21,7 @@ impl FreeId {
 /// longer reaches the context unchecked (tests use the raw test-only entry).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CheckedTy(ExprId);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<CheckedTy>() == size_of::<ExprId>());
 impl CheckedTy {
     /// Trusted construction: minting
@@ -53,6 +55,7 @@ impl CheckedTy {
 /// `CheckedTy` for the optional `let`/binder value handle.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CheckedVal(ExprId);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<CheckedVal>() == size_of::<ExprId>());
 impl CheckedVal {
     /// Trusted construction (same token contract as `CheckedTy`): the
@@ -83,6 +86,7 @@ pub(crate) struct Local {
     has_value: bool,
     reserved: [u8; 2],
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Local>() == 16);
 impl Local {
     pub(crate) fn ty(self) -> ExprId {
@@ -351,11 +355,20 @@ impl LocalContext {
         a.and(c).and(d)
     }
 }
-fn release<T: Copy>(values: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: Copy + crate::resource::charged::Charged>(
+    values: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(values);
     b.release(bytes as u64)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    FreeId => 4,
+    Local => 16,
 }

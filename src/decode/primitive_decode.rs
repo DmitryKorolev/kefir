@@ -109,6 +109,7 @@ enum Kind {
     MData,
 }
 // Four fixed child slots cost 32 bytes per active record, not per stored node.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Option<Resolved>>() == 8);
 #[derive(Clone, Copy)]
 enum PendingComponent<'a> {
@@ -136,7 +137,7 @@ pub(crate) struct Scratch {
 }
 impl Scratch {
     pub(crate) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
-        let bytes = self.universes.capacity() * std::mem::size_of::<LevelId>();
+        let bytes = self.universes.capacity() * crate::resource::charged::bytes::<LevelId>();
         drop(self.universes);
         let e = self.declaration.retire(b);
         let e = e.and(self.inductive.retire(b));
@@ -546,6 +547,8 @@ pub(super) fn decode_header(
 }
 
 #[cfg(target_pointer_width = "64")]
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<PendingComponent>() == 24);
+#[cfg(target_pointer_width = "64")]
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Pending>() == 88);

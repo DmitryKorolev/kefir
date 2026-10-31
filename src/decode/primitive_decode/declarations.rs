@@ -49,7 +49,8 @@ impl Payload {
         self.hint.clear();
     }
     pub(super) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
-        let bytes = (self.parameters.capacity() + self.all.capacity()) * size_of::<NameId>()
+        let bytes = (self.parameters.capacity() + self.all.capacity())
+            * crate::resource::charged::bytes::<NameId>()
             + self.hint.capacity();
         drop(self);
         b.release(bytes as u64)

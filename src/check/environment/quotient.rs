@@ -8,6 +8,7 @@ pub(super) struct Package {
     pub names: [NameId; 7],
     pub seen: NonZeroU8,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<Package>>() == 32);
 impl QuotientRole {
     pub(super) const fn index(self) -> usize {

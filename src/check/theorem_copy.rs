@@ -6,6 +6,7 @@ use crate::syntax::expressions::{ExprId, ExprKind, ExpressionError, Expressions}
 use crate::syntax::levels::{LevelId, LevelKind, Levels, NameId};
 use crate::syntax::names::{Component, NameError, Names};
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
@@ -40,6 +41,7 @@ struct Bucket {
     key: u32,
     value: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Bucket>() == 8);
 /// value zero is vacant. Every indexed destination is a fresh non-atom node:
 /// name/level zero bypass both indices; expression copies follow >=1 originals.
@@ -140,10 +142,13 @@ impl Index {
         Ok(())
     }
 }
-fn release<T>(v: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: crate::resource::charged::Charged>(
+    v: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = v
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(v);
     b.release(bytes as u64)
@@ -175,6 +180,7 @@ struct Frame {
     node: Node,
     next: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() == 12);
 struct Stores<'a> {
     names: &'a mut Names,
@@ -617,4 +623,10 @@ fn append(s: &mut Stores<'_>, key: &Key<'_>, b: &mut Budget) -> Result<u32, Erro
         Key::Level(kind) => s.levels.append(*kind, s.names, b)?.slot(),
         Key::Expr(kind) => s.expressions.append(*kind, s.levels, s.names, b)?.slot(),
     })
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Bucket => 8,
+    Frame => 12,
 }

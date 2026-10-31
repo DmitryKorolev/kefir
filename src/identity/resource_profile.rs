@@ -4,6 +4,7 @@ use crate::identity::sha256::Sha256;
 use crate::profile::ENTRIES;
 use std::io::Write;
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Entry<'static>>() <= 64);
 
 pub(crate) fn encode(output: &mut impl Write) -> Result<[u8; 32], Error> {

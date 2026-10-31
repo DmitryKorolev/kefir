@@ -5,7 +5,9 @@ use crate::resource::{Budget, Event, ResourceError};
 use crate::syntax::expressions::ExprId;
 use crate::syntax::levels::{LevelNames, NameId};
 use crate::syntax::names::Names;
-use std::{mem::size_of, num::NonZeroU32};
+#[cfg(target_pointer_width = "64")]
+use std::mem::size_of;
+use std::num::NonZeroU32;
 
 /// Zero-sized trusted-construction authority for checkedness
 /// certificates minted by the environment machinery (completed inferences,
@@ -102,6 +104,7 @@ struct AuxiliaryTemplates {
     expression_end: u32,
     level_end: NonZeroU32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<AuxiliaryTemplates>>() == 8);
 #[derive(Clone, Copy)]
 struct Stage {
@@ -129,7 +132,9 @@ impl PreparedCommit<'_> {
         self.environment.stage = None;
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Formation>() == 8);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<Stage>>() == 24);
 
 #[derive(Clone, Copy, Default)]
@@ -156,6 +161,7 @@ struct Template {
     kind: StoredKind,
     safety: Safety,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Template>() == 48);
 
 /// Every usable entry must have completed all semantic obligations before
@@ -200,6 +206,7 @@ pub(crate) struct Environment {
 // state retain only original roots.
 // Fixed certificates include the160-byte remaining-Nat certificate, for 744 bytes
 // total. Entry layout remains48bytes; no per-declaration stage/certificate field.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Environment>() == 744);
 // Preparation-only, same-owner checkpoint minted before begin_stage. It cannot
 // authorize publication or generated-root lookup; it only bounds retirement.
@@ -208,6 +215,7 @@ struct SignatureStageCheckpoint {
     committed: u32,
     epoch: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SignatureStageCheckpoint>() == 40);
 impl Environment {
     /// Whether the memo records no rule for canonical name `canon`.
@@ -660,4 +668,9 @@ fn view<T>(store: &[T], span: Span) -> Result<&[T], ResourceError> {
     store
         .get(span.offset as usize..span.offset as usize + span.len as usize)
         .ok_or(ResourceError::Invariant)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Template => 48,
 }

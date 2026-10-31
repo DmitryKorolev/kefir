@@ -10,6 +10,7 @@ use crate::syntax::expressions::{BinderInfo, ExprId, ExprKind, Expressions, bind
 use crate::syntax::levels::{Levels, NameId};
 use crate::syntax::local_context::{CheckedTy, FreeId, LocalContext};
 use crate::syntax::names::Names;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 /// Completed beta/delta/zeta normal syntax under the checked-input premises.
@@ -20,6 +21,7 @@ pub(crate) struct Normal {
     pub expression: ExprId,
     pub height: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Normal>() == 8);
 
 #[derive(Clone, Copy)]
@@ -53,6 +55,7 @@ enum Frame {
         local: FreeId,
     },
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() <= 24);
 #[derive(Default)]
 struct Scratch {
@@ -309,4 +312,9 @@ impl Scope<'_> {
             None => result,
         }
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 24,
 }

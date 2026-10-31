@@ -7,7 +7,9 @@ mod families;
 mod memo;
 mod mutual;
 mod nested;
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<(ExprId, bool)>() == 8);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<(ExprId, u32, bool)>() == 12);
 mod scheme;
 
@@ -524,7 +526,7 @@ impl State {
         }
         let mut rules = Vec::new();
         let result = self.fieldless_inner(request, ordinal, decoder, budget, &mut rules);
-        let bytes = rules.capacity() * std::mem::size_of::<NullaryRule>();
+        let bytes = rules.capacity() * crate::resource::charged::bytes::<NullaryRule>();
         drop(rules);
         if bytes != 0 {
             budget
@@ -1059,7 +1061,7 @@ impl State {
             )
             .map_err(resource)?;
         let temporary = std::mem::take(rules);
-        let bytes = temporary.capacity() * std::mem::size_of::<NullaryRule>();
+        let bytes = temporary.capacity() * crate::resource::charged::bytes::<NullaryRule>();
         drop(temporary);
         budget.release(bytes as u64).map_err(resource)?;
         token.with_natural(natural).commit();

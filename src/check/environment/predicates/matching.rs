@@ -19,7 +19,9 @@ struct Scan {
     pairs: Vec<Pair>,
     frames: Vec<Frame>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Pair>() == 8 && size_of::<Frame>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Scan>() == 48);
 
 pub(super) fn name(
@@ -105,13 +107,13 @@ impl Scan {
                 Ok(())
             })();
             if let Err(error) = result {
-                let bytes = next.capacity() * size_of::<Pair>();
+                let bytes = next.capacity() * crate::resource::charged::bytes::<Pair>();
                 drop(next);
                 b.release(bytes as u64)?;
                 return Err(error);
             }
             let old = std::mem::replace(&mut self.pairs, next);
-            let bytes = old.capacity() * size_of::<Pair>();
+            let bytes = old.capacity() * crate::resource::charged::bytes::<Pair>();
             drop(old);
             b.release(bytes as u64)?;
         }
@@ -245,8 +247,8 @@ impl Scan {
     }
     fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
         let frames = self.frames.len();
-        let bytes =
-            self.frames.capacity() * size_of::<Frame>() + self.pairs.capacity() * size_of::<Pair>();
+        let bytes = self.frames.capacity() * crate::resource::charged::bytes::<Frame>()
+            + self.pairs.capacity() * crate::resource::charged::bytes::<Pair>();
         drop(self);
         let storage = b.release(bytes as u64);
         let frames = b.release_frames(frames);
@@ -265,4 +267,10 @@ pub(super) fn expression(
     let result = scan.run(expected, actual, e, l, n, b);
     scan.retire(b)?;
     result
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Pair => 8,
+    Frame => 12,
 }

@@ -39,8 +39,10 @@ impl HeadSpine {
         &self.arguments[..self.len]
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<HeadSpine>() == 48);
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Record>() == 20);
 #[derive(Clone, Copy, Default)]
 struct Entry {
@@ -53,7 +55,9 @@ struct Entry {
     start: u32,
     count: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 32);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(TABLE_LIMIT * size_of::<Entry>() == 256 * 1024);
 #[derive(Default)]
 pub(crate) struct Cache {
@@ -65,6 +69,7 @@ pub(crate) struct Cache {
     scan: Vec<u32>,
     used: usize,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Cache>() == 104);
 /// Resolve each demanded replacement once, in the plan's original occurrence
 /// order. Capacity survives for reuse, but each call clears the contents before
@@ -781,4 +786,10 @@ fn release_failed_growth<T>(
         Ok(())
     };
     worse_resource_error(error, a.and(c).err())
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 32,
+    Record => 20,
 }

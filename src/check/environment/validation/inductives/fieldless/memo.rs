@@ -3,6 +3,7 @@
 //! scope. Only postorder completed successes enter; no equality closure.
 use super::*;
 use std::hash::{Hash, Hasher};
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Default)]
@@ -11,12 +12,14 @@ struct Entry {
     depth: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 12);
 #[derive(Default)]
 pub(super) struct Memo {
     entries: Vec<Entry>,
     used: usize,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Memo>() == 32);
 impl Memo {
     fn key(node: ExprId, depth: u32) -> Entry {
@@ -86,7 +89,7 @@ impl Memo {
             if let Err(e) = result {
                 let bytes = next
                     .capacity()
-                    .checked_mul(size_of::<Entry>())
+                    .checked_mul(crate::resource::charged::bytes::<Entry>())
                     .ok_or(ResourceError::Counter)?;
                 drop(next);
                 b.release(bytes as u64)?;
@@ -95,7 +98,7 @@ impl Memo {
             let old = std::mem::replace(&mut self.entries, next);
             let bytes = old
                 .capacity()
-                .checked_mul(size_of::<Entry>())
+                .checked_mul(crate::resource::charged::bytes::<Entry>())
                 .ok_or(ResourceError::Counter)?;
             drop(old);
             b.release(bytes as u64)?;
@@ -110,9 +113,14 @@ impl Memo {
         let bytes = self
             .entries
             .capacity()
-            .checked_mul(size_of::<Entry>())
+            .checked_mul(crate::resource::charged::bytes::<Entry>())
             .ok_or(ResourceError::Counter)?;
         drop(self);
         b.release(bytes as u64)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 12,
 }

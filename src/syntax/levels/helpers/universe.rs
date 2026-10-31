@@ -5,6 +5,7 @@ use crate::resource::{Budget, ResourceError};
 use crate::syntax::levels::{LevelId, LevelKind, OrderedLevelNames};
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 mod domination;
@@ -30,12 +31,14 @@ enum Frame {
         results: usize,
     },
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() <= 32);
 #[derive(Clone, Copy, Default)]
 struct SeenEntry {
     source: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SeenEntry>() == 8);
 #[derive(Default)]
 struct Seen {
@@ -115,13 +118,21 @@ impl Seen {
         Ok(true)
     }
 }
-fn push<T: Copy>(v: &mut Vec<T>, value: T, b: &mut Budget) -> Result<(), ResourceError> {
+fn push<T: Copy + crate::resource::charged::Charged>(
+    v: &mut Vec<T>,
+    value: T,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let needed = v.len().checked_add(1).ok_or(ResourceError::Counter)?;
     b.grow_vec(v, needed)?;
     v.push(value);
     Ok(())
 }
-fn frame<T: Copy>(v: &mut Vec<T>, value: T, b: &mut Budget) -> Result<(), ResourceError> {
+fn frame<T: Copy + crate::resource::charged::Charged>(
+    v: &mut Vec<T>,
+    value: T,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     b.reserve_frames(1)?;
     if let Err(error) = push(v, value, b) {
         b.release_frames(1)?;
@@ -493,4 +504,10 @@ impl<N: OrderedLevelNames> Normalizer<'_, '_, '_, N> {
             root = largest;
         }
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 32,
+    SeenEntry => 8,
 }

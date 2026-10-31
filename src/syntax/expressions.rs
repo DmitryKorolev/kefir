@@ -5,6 +5,7 @@ use crate::resource::{Budget, ResourceError, STRUCTURE_DEPTH};
 use crate::syntax::levels::{LevelId, LevelNames, Levels, NameId};
 
 pub(crate) mod binding;
+mod nodes;
 
 pub(crate) mod reduction;
 
@@ -154,6 +155,7 @@ struct StoredExpression {
     fingerprint: u32,
     loose: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<StoredExpression>() == 20);
 
 impl StoredExpression {
@@ -174,9 +176,13 @@ struct NodePlan {
     extra: Option<u32>,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Descriptor>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Expression<'_>>() == 16);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<LevelId>() == 4);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<[u32; 5]>() == 20);
 
 impl Expression<'_> {
@@ -377,7 +383,7 @@ impl From<ResourceError> for ExpressionError {
 /// a separate integration obligation, not permission to retain declaration junk.
 #[derive(Default)]
 pub(crate) struct Expressions {
-    nodes: Vec<StoredExpression>,
+    nodes: nodes::Nodes,
     // Structural index, not a judgment cache: scope is this originating store.
     // One base per 16 nodes; each escaped node stores its exact local ordinal.
     // Append publishes all three owners together, and suffix rollback retires
@@ -499,7 +505,7 @@ impl Expressions {
         u32::try_from(nodes).map_err(|_| ResourceError::Storage)?;
         u32::try_from(levels).map_err(|_| ResourceError::Storage)?;
         u32::try_from(bytes).map_err(|_| ResourceError::Storage)?;
-        budget.grow_vec(&mut self.nodes, nodes)?;
+        nodes::grow(budget, &mut self.nodes, nodes)?;
         // The String expansion caller publishes only constants with 0/1
         // universe arguments, applications and natural literals: every third
         // descriptor word fits inline. Its complete reservation therefore needs
@@ -651,8 +657,8 @@ impl Expressions {
         // The budget helper has no charges/events when capacity suffices.
         // Keep that predicate at the caller to avoid its growth-path frame on
         // ordinary appends; every actual growth still uses the same helper.
-        if required > self.nodes.capacity() {
-            budget.grow_vec(&mut self.nodes, required)?;
+        if !nodes::has_room(&self.nodes, required) {
+            nodes::grow(budget, &mut self.nodes, required)?;
         }
         if first {
             budget.grow_vec(&mut self.extra_bases, required.div_ceil(OPERAND_BLOCK))?;
@@ -1104,4 +1110,15 @@ fn span<T>(values: &[T], start: u32, len: u32) -> Result<&[T], ResourceError> {
     values
         .get(start as usize..end)
         .ok_or(ResourceError::Invariant)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    ExprId => 4,
+    StoredExpression => 20,
+    Option<ExprId> => 8,
+    (ExprId, ExprId) => 8,
+    (NameId, ExprId, BinderInfo) => 12,
+    (ExprId, bool) => 8,
+    (ExprId, u32, bool) => 12,
 }

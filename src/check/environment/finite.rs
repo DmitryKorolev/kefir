@@ -18,6 +18,7 @@ pub(super) struct Certificate {
     slots: [u32; 5],
     frontier: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Certificate>() == 72);
 impl Certificate {
     fn dependencies(

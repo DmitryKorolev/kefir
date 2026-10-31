@@ -8,6 +8,7 @@ struct Entry {
     kind: u32, // family=0, constructor=1, recursor=2
     position: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Entry>() == 12);
 #[derive(Default)]
 struct Plan {
@@ -215,13 +216,13 @@ impl Plan {
             }
             Ok(())
         })();
-        let bytes = used.capacity() * std::mem::size_of::<u32>();
+        let bytes = used.capacity() * crate::resource::charged::bytes::<u32>();
         drop(used);
         work.budget.release(bytes as u64)?;
         result
     }
     fn retire(self, budget: &mut Budget) -> Result<(), ResourceError> {
-        let bytes = self.entries.capacity() * std::mem::size_of::<Entry>()
+        let bytes = self.entries.capacity() * crate::resource::charged::bytes::<Entry>()
             + (self.constructors.capacity() + self.recursors.capacity() + self.indices.capacity())
                 * 4;
         drop(self);
@@ -240,7 +241,7 @@ impl State {
         let mut plan = Plan::default();
         let mut rules = Vec::new();
         let result = self.mutual_inner(request, ordinal, decoder, budget, &mut plan, &mut rules);
-        let bytes = rules.capacity() * std::mem::size_of::<NullaryRule>();
+        let bytes = rules.capacity() * crate::resource::charged::bytes::<NullaryRule>();
         drop(rules);
         let release = budget.release(bytes as u64);
         plan.retire(budget).map_err(ResourceError::failure_report)?;
@@ -612,7 +613,7 @@ impl State {
                 .commit();
             Ok(())
         })();
-        let bytes = metadata.capacity() * std::mem::size_of::<NullaryMetadata<'_>>();
+        let bytes = metadata.capacity() * crate::resource::charged::bytes::<NullaryMetadata<'_>>();
         drop(metadata);
         budget.release(bytes as u64).map_err(resource)?;
         result?;
@@ -621,4 +622,9 @@ impl State {
         budget.observe(Event::DeclarationsInstalled, plan.entries.len() as u64);
         Ok(Admission::Installed)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 12,
 }

@@ -12,6 +12,7 @@ struct Entry {
     hash: u32,
     permission: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 20);
 const PROBES: usize = 8;
 #[derive(Default)]
@@ -20,6 +21,7 @@ pub(super) struct Cache {
     used: usize,
     stopped: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Cache>() == 40);
 /// Immutable request identity, not proof that its evaluator completed. The
 /// driver may consult this only in Completed::Head and publish after retirement.
@@ -30,6 +32,7 @@ pub(super) struct Origin {
     incoming: ReductionPath,
     exposure: Exposure,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Origin>() == 24);
 impl Origin {
     pub(super) fn new(source: ExprId, incoming: ReductionPath, exposure: Exposure) -> Self {
@@ -196,7 +199,7 @@ impl Cache {
                 .ok_or(ResourceError::Counter)?
                 .max(16);
             let bytes = cap
-                .checked_mul(size_of::<Entry>())
+                .checked_mul(crate::resource::charged::bytes::<Entry>())
                 .ok_or(ResourceError::Counter)? as u64;
             if !work.budget.has_storage_headroom(bytes) || !work.caches.reserve(bytes)? {
                 self.stopped = true;
@@ -280,7 +283,7 @@ fn release(
 ) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<Entry>())
+        .checked_mul(crate::resource::charged::bytes::<Entry>())
         .ok_or(ResourceError::Counter)? as u64;
     drop(values);
     let cache = session.release(bytes);
@@ -296,4 +299,9 @@ fn select(error: ResourceError, cleanup: Option<ResourceError>) -> ResourceError
     cleanup
         .filter(|e| e.failure_report().outcome == FailureOutcome::InternalError)
         .unwrap_or(error)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 20,
 }

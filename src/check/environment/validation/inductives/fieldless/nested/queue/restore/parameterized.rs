@@ -13,7 +13,9 @@ struct Value {
     pending: Option<u32>,
     consumed: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Value>() == 16);
 
 impl Restorer<'_> {
@@ -325,4 +327,10 @@ fn raw_kind<'a>(root: ExprId, work: &'a mut Working<'_>) -> Result<ExprKind<'a>,
         .expressions
         .get(root, work.budget)?
         .kind(work.expressions, work.levels, work.budget)?)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Value => 16,
+    Frame => 12,
 }

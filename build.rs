@@ -4,11 +4,29 @@
 mod identity;
 #[path = "src/resource/profile.rs"]
 mod profile;
+#[path = "src/resource/wasm_layout.rs"]
+mod wasm_layout;
 use identity::{build as build_identity, resource_profile as resource_identity, specification};
 
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
+    // Every wasm build links with the stack the kernel's guard assumes and
+    // with the trapping memory limit, whatever flags the caller passes.
+    if env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|f| f.split(',').any(|f| f == "wasm")) {
+        println!(
+            "cargo:rustc-link-arg=-zstack-size={}",
+            wasm_layout::STACK_BYTES
+        );
+        println!(
+            "cargo:rustc-link-arg=--max-memory={}",
+            wasm_layout::MAX_MEMORY_BYTES
+        );
+        println!(
+            "cargo:rustc-link-arg=--initial-memory={}",
+            wasm_layout::INITIAL_MEMORY_BYTES
+        );
+    }
     // Any failure aborts Cargo's build script; no fallback or placeholder identity.
     // OUT_DIR is Cargo-owned. Supported attribution additionally requires the
     // consumer's fresh target and stable source/dependency/executable checks.

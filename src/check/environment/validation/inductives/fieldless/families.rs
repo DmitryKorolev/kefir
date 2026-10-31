@@ -52,7 +52,7 @@ impl FamilySet {
             .map(|index| self.rows[index].1 as usize))
     }
     pub(super) fn retire(self, budget: &mut Budget) -> Result<(), ResourceError> {
-        let bytes = self.rows.capacity() * std::mem::size_of::<(u32, u32)>();
+        let bytes = self.rows.capacity() * crate::resource::charged::bytes::<(u32, u32)>();
         drop(self);
         budget.release(bytes as u64)
     }

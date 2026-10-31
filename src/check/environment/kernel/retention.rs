@@ -179,6 +179,7 @@ pub(in crate::check::environment) struct Retention {
     slot: Vec<Snapshot>,
     published: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Retention>() == 32);
 
 /// Evaluate every cleanup first. An internal failure dominates a resource
@@ -217,16 +218,19 @@ fn release(k: &mut Kernel<'_, '_>, bytes: u64) -> R<()> {
     k.reserved = remaining;
     Ok(())
 }
-fn drop_vec<T>(k: &mut Kernel<'_, '_>, values: Vec<T>) -> R<()> {
+fn drop_vec<T: crate::resource::charged::Charged>(k: &mut Kernel<'_, '_>, values: Vec<T>) -> R<()> {
     let bytes = if values.is_empty() {
         0
     } else {
-        logical(values.len()) * size_of::<T>()
+        logical(values.len()) * crate::resource::charged::bytes::<T>()
     };
     drop(values);
     release(k, bytes as u64)
 }
-pub(super) fn drop_map<K, V>(k: &mut Kernel<'_, '_>, values: Map<K, V>) -> R<()> {
+pub(super) fn drop_map<K, V>(k: &mut Kernel<'_, '_>, values: Map<K, V>) -> R<()>
+where
+    (K, V): crate::resource::charged::Charged,
+{
     let bytes = if values.is_empty() {
         0
     } else {
@@ -235,7 +239,10 @@ pub(super) fn drop_map<K, V>(k: &mut Kernel<'_, '_>, values: Map<K, V>) -> R<()>
     drop(values);
     release(k, bytes as u64)
 }
-fn drop_lossy<K: LossyKey, V: Copy>(k: &mut Kernel<'_, '_>, values: Lossy<K, V>) -> R<()> {
+fn drop_lossy<K: LossyKey, V: Copy>(k: &mut Kernel<'_, '_>, values: Lossy<K, V>) -> R<()>
+where
+    Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
+{
     let bytes = values.size * Lossy::<K, V>::SLOT;
     drop(values);
     release(k, bytes as u64)
@@ -264,7 +271,7 @@ impl Retention {
             return Err(ResourceError::Invariant);
         }
         budget.charge_work(1)?;
-        let bytes = size_of::<Snapshot>() as u64;
+        let bytes = crate::resource::charged::bytes::<Snapshot>() as u64;
         budget.reserve(bytes)?;
         let mut slot = Vec::new();
         if slot.try_reserve_exact(1).is_err() {
@@ -336,7 +343,7 @@ impl Retention {
         let level_bytes = if count == 0 {
             0
         } else {
-            logical(count) * size_of::<crate::syntax::levels::Level>()
+            logical(count) * crate::resource::charged::bytes::<crate::syntax::levels::Level>()
         };
         // Borrowed metadata and speculative/failed-route receipts never escape.
         let views = std::mem::take(&mut k.consts);
@@ -354,7 +361,7 @@ impl Retention {
         // Count the persistent header exactly once, even before its allocation.
         if k.reserved
             .saturating_add(level_bytes as u64)
-            .saturating_add(size_of::<Snapshot>() as u64)
+            .saturating_add(crate::resource::charged::bytes::<Snapshot>() as u64)
             > QUOTA
         {
             return Ok(());
@@ -395,7 +402,7 @@ impl Retention {
     ) -> Result<(), ResourceError> {
         self.published = false;
         let mut slot = std::mem::take(&mut self.slot);
-        let header = (slot.capacity() * size_of::<Snapshot>()) as u64;
+        let header = (slot.capacity() * crate::resource::charged::bytes::<Snapshot>()) as u64;
         let invalid = slot.capacity() > 1 || slot.len() > 1;
         let snapshot = slot.pop();
         // The single-slot invariant is by construction; retain an internal
@@ -417,4 +424,9 @@ impl Retention {
         let release = budget.release(header);
         select_cleanup([result, release])
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Snapshot => 1824,
 }

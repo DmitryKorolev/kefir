@@ -10,6 +10,7 @@ pub(super) struct Scratch {
     pub(super) values: Vec<u32>,
     pub(super) slots: usize,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Scratch>() == 32);
 
 impl Deref for Scratch {
@@ -36,4 +37,9 @@ impl<'a> IntoIterator for &'a mut Scratch {
     fn into_iter(self) -> Self::IntoIter {
         self.values.iter_mut()
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Scratch => 32,
 }

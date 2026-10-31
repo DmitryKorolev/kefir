@@ -39,8 +39,11 @@ struct Key {
     len: u32,
     hash: u64,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Family>() == 24);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Constructor>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Key>() == 24);
 
 #[derive(Default)]
@@ -52,22 +55,34 @@ pub(super) struct Queue {
     next_name: u32,
     original_constructors: Vec<ExprId>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Queue>() == 128);
-fn push<T>(v: &mut Vec<T>, x: T, b: &mut Budget) -> Result<(), Stop> {
+fn push<T: crate::resource::charged::Charged>(
+    v: &mut Vec<T>,
+    x: T,
+    b: &mut Budget,
+) -> Result<(), Stop> {
     let n = v.len().checked_add(1).ok_or(ResourceError::Counter)?;
     b.grow_vec(v, n)?;
     v.push(x);
     Ok(())
 }
-fn release<T>(v: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: crate::resource::charged::Charged>(
+    v: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = v
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(v);
     b.release(bytes as u64)
 }
-fn push_frame<T>(v: &mut Vec<T>, x: T, b: &mut Budget) -> Result<(), Stop> {
+fn push_frame<T: crate::resource::charged::Charged>(
+    v: &mut Vec<T>,
+    x: T,
+    b: &mut Budget,
+) -> Result<(), Stop> {
     b.reserve_frames(1)?;
     if let Err(error) = push(v, x, b) {
         b.release_frames(1)?;
@@ -82,7 +97,10 @@ fn pop_frame<T>(v: &mut Vec<T>, b: &mut Budget) -> Result<Option<T>, Stop> {
     }
     Ok(item)
 }
-fn release_stack<T>(v: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release_stack<T: crate::resource::charged::Charged>(
+    v: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let frames = b.release_frames(v.len());
     let storage = release(v, b);
     frames?;
@@ -627,4 +645,11 @@ fn finish_parameters(
         return result.and(Err(error.into()));
     }
     result
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Key => 24,
+    Constructor => 12,
+    Family => 24,
 }

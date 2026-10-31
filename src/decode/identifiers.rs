@@ -69,6 +69,7 @@ struct Entry {
     slot: u32,
     len: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Entry>() == 24);
 
 /// Whole-input owner: these flat allocations stay live until the semantic
@@ -309,4 +310,9 @@ impl IdIndex {
         drop(old);
         budget.release(bytes)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 24,
 }

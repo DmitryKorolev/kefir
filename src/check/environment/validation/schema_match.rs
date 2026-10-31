@@ -120,11 +120,16 @@ pub(super) fn matches(work: &mut Working<'_>, a: ExprId, b: ExprId) -> Result<bo
         Ok(true)
     })();
     let n = pairs.len();
-    let bytes = pairs.capacity() * std::mem::size_of::<Pair>();
+    let bytes = pairs.capacity() * crate::resource::charged::bytes::<Pair>();
     drop(pairs);
     let frames = work.budget.release_frames(n);
     let storage = work.budget.release(bytes as u64);
     frames?;
     storage?;
     result
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Pair => 12,
 }

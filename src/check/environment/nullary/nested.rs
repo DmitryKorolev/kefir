@@ -244,3 +244,8 @@ impl Environment {
         })
     }
 }
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    RestoredMetadata<'_> => 40,
+}

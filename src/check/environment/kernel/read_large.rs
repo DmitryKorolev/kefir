@@ -134,3 +134,8 @@ impl Kernel<'_, '_> {
         Ok(Some((e.slot(), li, u32::from(checking), token)))
     }
 }
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    (u32, Option<[u64; 4]>) => 48,
+}

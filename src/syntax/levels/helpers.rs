@@ -4,7 +4,9 @@
 use super::{LevelId, LevelKind, LevelNames, LevelPositive, Levels};
 use crate::resource::{Budget, ResourceError};
 use std::hash::Hasher;
-use std::mem::{size_of, take};
+#[cfg(target_pointer_width = "64")]
+use std::mem::size_of;
+use std::mem::take;
 
 mod memo;
 #[allow(
@@ -29,6 +31,7 @@ struct Entry {
     hash: u32,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 16);
 
 /// PAIR: (a,b) -> Boolean in value. Otherwise: a -> (base=b,offset=value).
@@ -147,10 +150,13 @@ impl<const PAIR: bool> Memo<PAIR> {
 
 /// Flat Copy payloads have no child-following destruction. A caller precharges
 /// its bounded number of allocation releases; cleanup still runs on failure.
-fn release_vec<T: Copy>(values: Vec<T>, budget: &mut Budget) -> Result<(), ResourceError> {
+fn release_vec<T: Copy + crate::resource::charged::Charged>(
+    values: Vec<T>,
+    budget: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(values);
     budget.release(bytes as u64)
@@ -162,6 +168,7 @@ enum Frame {
     Finish(LevelId, LevelId),
     Offset(LevelId),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() <= 16);
 
 pub(crate) struct Helpers<'a, N> {
@@ -471,4 +478,10 @@ impl<N: LevelNames> Helpers<'_, N> {
         self.levels
             .append(LevelKind::IMax(a, b), self.names, self.budget)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 16,
+    Frame => 12,
 }

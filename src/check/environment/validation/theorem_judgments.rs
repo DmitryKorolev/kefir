@@ -4,7 +4,9 @@
 //! cannot be recycled/rebound in this owner; extension preserves these judgments.
 use crate::decode::primitive_decode::declarations::{Kind, Request, Safety};
 use crate::resource::{Budget, ResourceError};
-use std::mem::{size_of, take};
+#[cfg(target_pointer_width = "64")]
+use std::mem::size_of;
+use std::mem::take;
 
 const SLOTS: usize = 4096;
 const BUCKETS: usize = SLOTS;
@@ -20,7 +22,9 @@ pub(super) struct Key {
     count: u8,
     policy: u8,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Key>() == 28);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<Key>>() == 32);
 impl Key {
     fn bucket(self) -> usize {
@@ -56,7 +60,9 @@ struct Bucket {
     head: u16,
     len: u16,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 36);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Bucket>() == 4);
 // POISON is never an entry index. It fences any accidental standalone retry
 // after spending scan credits without successful publication; retire accepts it.
@@ -72,6 +78,7 @@ pub(super) struct Judgments {
     pending_old_bucket: u16,
     pending_new_bucket: u16,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Judgments>() == 88);
 
 impl Judgments {
@@ -380,8 +387,8 @@ impl Judgments {
         self.hand = 0;
         let entries = take(&mut self.entries);
         let buckets = take(&mut self.buckets);
-        let bytes =
-            entries.capacity() * size_of::<Entry>() + buckets.capacity() * size_of::<Bucket>();
+        let bytes = entries.capacity() * crate::resource::charged::bytes::<Entry>()
+            + buckets.capacity() * crate::resource::charged::bytes::<Bucket>();
         drop(entries);
         drop(buckets);
         if bytes == 0 {
@@ -390,4 +397,10 @@ impl Judgments {
             budget.release(bytes as u64)
         }
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 36,
+    Bucket => 4,
 }

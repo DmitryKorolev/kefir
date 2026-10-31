@@ -17,6 +17,7 @@ enum Frame {
     OrDone(LevelId, LevelId),
     Tail(LevelId, LevelId),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Frame>() <= 16);
 fn push(stack: &mut Vec<Frame>, frame: Frame, b: &mut Budget) -> Result<(), ResourceError> {
     let n = stack.len().checked_add(1).ok_or(ResourceError::Counter)?;
@@ -207,4 +208,9 @@ impl<N: OrderedLevelNames> Helpers<'_, N> {
             None => result,
         }
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 16,
 }

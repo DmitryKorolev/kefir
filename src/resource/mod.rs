@@ -1,4 +1,5 @@
 //! Always-on semantic accounting, independent of optional diagnostics.
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 // Test harness service is present in the separately compiled component tests too.
@@ -10,11 +11,18 @@ pub(crate) use traced;
 
 pub(crate) mod failure;
 
+pub(crate) mod charged;
 #[allow(
     dead_code,
     reason = "Complete accepted profile is shared with build identity tooling"
 )]
 pub(crate) mod profile;
+#[cfg(target_family = "wasm")]
+#[allow(
+    dead_code,
+    reason = "Linker settings are read by build.rs; the library reads the stack size"
+)]
+pub(crate) mod wasm_layout;
 
 pub(crate) const CONTEXT_DEPTH: usize = profile::CONTEXT_DEPTH;
 pub(crate) const INPUT_BYTES: u64 = profile::INPUT_BYTES;
@@ -108,6 +116,7 @@ impl ReductionPath {
         })
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ReductionPath>() == 4);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -125,6 +134,7 @@ pub(crate) struct Progress {
     pub records: u64,
     pub checked_declarations: u64,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Progress>() == 24);
 
 pub(crate) struct Budget {
@@ -450,7 +460,8 @@ impl Budget {
 
     /// The vector's existing capacity must already be charged to this ledger.
     /// T must have constant-time drop without recursively following child links.
-    pub(crate) fn grow_vec<T>(
+    /// Charges use T's 64-bit size on every target.
+    pub(crate) fn grow_vec<T: charged::Charged>(
         &mut self,
         values: &mut Vec<T>,
         required: usize,
@@ -464,23 +475,21 @@ impl Budget {
             .ok_or(ResourceError::Counter)?
             .max(required)
             .max(8);
-        let new_bytes = capacity
-            .checked_mul(size_of::<T>())
+        // Byte counts are u64 on every target: a 32-bit usize must not turn a
+        // charge that native makes into a counter overflow.
+        let item = charged::bytes::<T>() as u64;
+        let new_bytes = (capacity as u64)
+            .checked_mul(item)
             .ok_or(ResourceError::Counter)?;
-        let old_bytes = old
-            .checked_mul(size_of::<T>())
+        let old_bytes = (old as u64)
+            .checked_mul(item)
             .ok_or(ResourceError::Counter)?;
         // Reallocation can copy the entire old requested layout. Charge once
         // before entering the allocator; the loop is bounded by this byte span.
-        self.charge_work(
-            u64::try_from(old_bytes)
-                .map_err(|_| ResourceError::Counter)?
-                .checked_add(1)
-                .ok_or(ResourceError::Counter)?,
-        )?;
-        self.reserve(u64::try_from(new_bytes).map_err(|_| ResourceError::Counter)?)?;
+        self.charge_work(old_bytes.checked_add(1).ok_or(ResourceError::Counter)?)?;
+        self.reserve(new_bytes)?;
         if values.try_reserve_exact(capacity - values.len()).is_err() {
-            self.release(new_bytes as u64)?;
+            self.release(new_bytes)?;
             return Err(ResourceError::Allocation);
         }
         // One physically successful semantic allocator request.
@@ -491,7 +500,7 @@ impl Budget {
         if values.capacity() != capacity {
             return Err(ResourceError::Invariant);
         }
-        self.release(old_bytes as u64)
+        self.release(old_bytes)
     }
 }
 
@@ -503,6 +512,7 @@ impl Budget {
 pub(crate) struct SessionCacheBudget {
     live: u64,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<SessionCacheBudget>() == 8);
 impl SessionCacheBudget {
     pub(crate) fn reserve(&mut self, bytes: u64) -> Result<bool, ResourceError> {
@@ -725,4 +735,9 @@ impl Diagnostics {
     pub(crate) fn allocation_failed(&mut self) {
         self.state.unavailable = true;
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    (u32, u32, ReductionPath) => 12,
 }

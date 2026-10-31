@@ -4,6 +4,7 @@ use super::Normal;
 use crate::resource::{Budget, Event, ReductionPath, ResourceError, SessionCacheBudget, profile};
 use crate::syntax::expressions::Expressions;
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -13,6 +14,7 @@ struct Entry {
     height: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 16);
 
 /// Scope required BEFORE semantic use: one fixed ordinary declaration session,
@@ -33,6 +35,7 @@ pub(crate) struct Cache {
     used: usize,
     stopped: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Cache>() <= 40);
 impl Cache {
     fn key(source: u32) -> Entry {
@@ -148,7 +151,7 @@ impl Cache {
             .ok_or(ResourceError::Counter)?
             .max(16);
         let bytes = cap
-            .checked_mul(size_of::<Entry>())
+            .checked_mul(crate::resource::charged::bytes::<Entry>())
             .ok_or(ResourceError::Counter)? as u64;
         // No allocation or semantic reservation until BOTH complete peak checks
         // pass. Old table capacity remains charged throughout replacement.
@@ -194,10 +197,15 @@ fn release(
 ) -> Result<(), ResourceError> {
     let bytes = entries
         .capacity()
-        .checked_mul(size_of::<Entry>())
+        .checked_mul(crate::resource::charged::bytes::<Entry>())
         .ok_or(ResourceError::Counter)? as u64;
     drop(entries);
     let a = session.release(bytes);
     let c = b.release(bytes);
     a.and(c)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 16,
 }

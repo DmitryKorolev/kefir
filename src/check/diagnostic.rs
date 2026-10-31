@@ -58,6 +58,7 @@ pub(crate) struct Rendered {
     len: usize,
     truncated: Truncated,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Rendered>() <= MAX_OUTPUT + 16);
 
 #[derive(Clone, Copy)]
@@ -224,6 +225,7 @@ struct Printer<'a> {
     frame_len: usize,
     variadic_edges_remaining: usize,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Printer<'static>>() <= 32 * 1024);
 
 impl<'a> Printer<'a> {

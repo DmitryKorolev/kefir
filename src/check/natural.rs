@@ -22,7 +22,9 @@ pub(crate) struct Digits {
     text: String,
     reserved: u64,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<Digits>() == 32);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(core::mem::size_of::<BigUint>() == 24);
 
 impl Digits {

@@ -44,7 +44,9 @@ pub(crate) struct InductiveView<'a> {
     pub num_indices: u32,
     pub constructors: &'a [NullaryRule],
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<RecursorView<'_>>() == 40);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<InductiveView<'_>>() == 32);
 
 #[derive(Clone, Copy)]
@@ -58,6 +60,7 @@ pub(super) struct FamilyRecord {
     slot: u32,
     primary: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<FamilyRecord>() == 8);
 
 #[derive(Clone, Copy)]
@@ -72,8 +75,11 @@ pub(super) struct RecursorRecord {
     common_prefix: u32,
     constructor_params: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ConstructorRecord>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<RecursorRecord>() == 36);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<NullaryRule>() == 12);
 
 fn same_parameters(
@@ -445,15 +451,39 @@ impl Environment {
     /// row must be visited to reclaim its flat capacities.
     pub(crate) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
         let capacities = [
-            (self.entries.capacity(), size_of::<Template>()),
-            (self.by_name.capacity(), size_of::<u32>()),
-            (self.names.capacity(), size_of::<NameId>()),
+            (
+                self.entries.capacity(),
+                crate::resource::charged::bytes::<Template>(),
+            ),
+            (
+                self.by_name.capacity(),
+                crate::resource::charged::bytes::<u32>(),
+            ),
+            (
+                self.names.capacity(),
+                crate::resource::charged::bytes::<NameId>(),
+            ),
             (self.hints.capacity(), 1),
-            (self.constructors.capacity(), size_of::<ConstructorRecord>()),
-            (self.recursors.capacity(), size_of::<RecursorRecord>()),
-            (self.families.capacity(), size_of::<FamilyRecord>()),
-            (self.rules.capacity(), size_of::<NullaryRule>()),
-            (self.no_rule.capacity(), size_of::<u64>()),
+            (
+                self.constructors.capacity(),
+                crate::resource::charged::bytes::<ConstructorRecord>(),
+            ),
+            (
+                self.recursors.capacity(),
+                crate::resource::charged::bytes::<RecursorRecord>(),
+            ),
+            (
+                self.families.capacity(),
+                crate::resource::charged::bytes::<FamilyRecord>(),
+            ),
+            (
+                self.rules.capacity(),
+                crate::resource::charged::bytes::<NullaryRule>(),
+            ),
+            (
+                self.no_rule.capacity(),
+                crate::resource::charged::bytes::<u64>(),
+            ),
         ];
         let bytes = capacities
             .into_iter()
@@ -466,4 +496,13 @@ impl Environment {
         drop(self);
         b.release(bytes as u64)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    ConstructorRecord => 12,
+    FamilyRecord => 8,
+    RecursorRecord => 36,
+    NullaryRule => 12,
+    NullaryMetadata<'_> => 40,
 }

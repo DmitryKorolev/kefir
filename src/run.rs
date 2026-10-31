@@ -161,6 +161,14 @@ impl Run {
         // Unit tests check inline: they drive the run through thread-local
         // switches and counters, and their harness threads already have large
         // stacks. Integration tests and production take the thread.
+        // wasm32-wasip1 has no threads: check on the calling thread,
+        // whose linear-memory stack is sized at link time to CHECK_STACK.
+        #[cfg(target_family = "wasm")]
+        {
+            crate::check::environment::kernel::mark_stack_base();
+            return self.check_here(reader, output);
+        }
+        #[cfg(not(target_family = "wasm"))]
         let checked = std::thread::scope(|scope| {
             let this = &mut *self;
             let output = &mut *output;
@@ -174,6 +182,7 @@ impl Run {
                 .ok()
                 .map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
         });
+        #[cfg(not(target_family = "wasm"))]
         match checked {
             Some(outcome) => outcome,
             None => self.emit(

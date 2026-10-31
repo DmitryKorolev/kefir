@@ -10,6 +10,7 @@ pub(crate) struct Span {
     start: u32,
     len: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Span>() == 8);
 
 #[derive(Default)]

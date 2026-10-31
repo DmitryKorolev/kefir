@@ -242,3 +242,8 @@ pub(super) fn rebuild(
         .expressions
         .append(kind, work.levels, work.names, work.budget)?)
 }
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 8,
+}

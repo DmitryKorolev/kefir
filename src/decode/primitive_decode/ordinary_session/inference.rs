@@ -6,6 +6,7 @@ use crate::resource::{Event, ReductionPath};
 use crate::syntax::expressions::{BinderInfo, binding::Binding};
 use crate::syntax::levels::LevelZero;
 use crate::syntax::local_context::{CheckedTy, CheckedVal, FreeId};
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 /// Zero-sized trusted-construction authority for checkedness
@@ -53,6 +54,7 @@ impl View {
         Self { expression, ..self }
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<View>() == 8);
 
 impl From<ResourceError> for Stop {
@@ -78,6 +80,7 @@ pub(crate) struct Inferred {
     pub ty: ExprId,
     pub path: ReductionPath,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Inferred>() == 8);
 
 #[derive(Clone, Copy)]
@@ -133,6 +136,7 @@ enum Frame {
         premises_path: ReductionPath,
     },
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() == 24);
 
 #[cfg(feature = "introspection")]
@@ -659,4 +663,9 @@ impl Working<'_> {
             _ => Err(ResourceError::Invariant.into()),
         }
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 24,
 }

@@ -171,3 +171,8 @@ pub(super) fn encode(root: ExprId, out: &mut Vec<u8>, work: &mut Working<'_>) ->
     release_stack(stack, work.budget)?;
     result
 }
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Visit => 8,
+}

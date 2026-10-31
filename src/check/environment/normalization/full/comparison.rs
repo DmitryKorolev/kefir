@@ -46,11 +46,13 @@ pub(crate) enum Decision {
     Equal(ReductionPath),
     Different(Evidence),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Decision>() == 8);
 struct Binders {
     locals: Vec<FreeId>,
     result: Decision,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Binders>() == 32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +195,7 @@ enum Phase {
     Complete,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Phase>() == 1);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -277,6 +280,7 @@ pub(crate) struct Machine {
 }
 // No new imported-node field or per-entry storage. The driver charges this
 // constant-sized owner only when storing a live suspended comparison job.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Machine>() == 232);
 
 /// Same setup for a stored comparison and an immediately completed C1 demand.

@@ -56,7 +56,7 @@ pub(super) fn failure(
 /// obeying the same duplicate-key, Unicode, depth and resource rules as any
 /// other object. The cold pass only runs on failure, so the success path
 /// needs this gate before a payload may be preserved. Publishes nothing.
-pub(super) fn validate_payload(input: &[u8], b: &mut Budget) -> Result<(), Cause> {
+pub(super) fn validate_payload(input: &[u8], depth: usize, b: &mut Budget) -> Result<(), Cause> {
     let mut state = State {
         observed: empty(),
         decoder: None,
@@ -64,7 +64,7 @@ pub(super) fn validate_payload(input: &[u8], b: &mut Budget) -> Result<(), Cause
         metadata: false,
         duplicate_id: false,
     };
-    walk(input, Some(Shape::JsonObject), 0, &mut state, b)?;
+    walk(input, Some(Shape::JsonObject), depth, &mut state, b)?;
     if state.observed.shape.duplicate || state.observed.shape.field {
         return Err(Cause::InvalidRecord);
     }

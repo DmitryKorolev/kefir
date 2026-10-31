@@ -81,6 +81,7 @@ impl DerefMut for GuardedHead {
         &mut self.machine
     }
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<GuardedHead>() == 176);
 
 struct Caches {
@@ -160,6 +161,7 @@ pub(in crate::decode::primitive_decode::ordinary_session::inference) struct Repl
     height: u32,
     tag: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Reply>() == 24);
 /// Valid only within this flat driver's fixed declaration/environment and while
 /// the ancestor controller remains suspended. Values/types are checked closed
@@ -215,6 +217,7 @@ pub(super) struct State {
     phase: Phase,
     finite: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<State>() <= 896);
 
 pub(super) fn ancestor_bank<'a>(
@@ -246,7 +249,7 @@ pub(super) fn begin(
     }
     // The nine fixed schema/destruction units were paid during mapping.
     // The case precharge waits for ordinary completed bound exposure.
-    let bytes = size_of::<State>() as u64;
+    let bytes = crate::resource::charged::bytes::<State>() as u64;
     work.budget.charge_work(1)?;
     work.budget.reserve(bytes)?;
     let mut owned = Vec::new();
@@ -761,7 +764,7 @@ impl State {
         let values = std::mem::take(&mut self.bank_values);
         let bytes = values
             .capacity()
-            .checked_mul(size_of::<ExprId>())
+            .checked_mul(crate::resource::charged::bytes::<ExprId>())
             .ok_or(ResourceError::Counter)?;
         drop(values);
         work.budget.release(bytes as u64)?;
@@ -921,7 +924,7 @@ pub(super) fn restore(
     let state = owned.pop().ok_or(ResourceError::Invariant)?;
     let bytes = owned
         .capacity()
-        .checked_mul(size_of::<State>())
+        .checked_mul(crate::resource::charged::bytes::<State>())
         .ok_or(ResourceError::Counter)?;
     drop(owned);
     work.budget.release(bytes as u64)?;
@@ -994,7 +997,7 @@ pub(super) fn retire(mut owned: Vec<State>, work: &mut Working<'_>) -> Result<()
     }
     let bytes = owned
         .capacity()
-        .checked_mul(size_of::<State>())
+        .checked_mul(crate::resource::charged::bytes::<State>())
         .ok_or(ResourceError::Counter)?;
     drop(owned);
     failure = machine::select_failure([
@@ -1004,4 +1007,9 @@ pub(super) fn retire(mut owned: Vec<State>, work: &mut Working<'_>) -> Result<()
         None,
     ]);
     failure.map_or(Ok(()), Err)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    State => 752,
 }

@@ -7,6 +7,7 @@ pub(super) struct Order {
     pub(super) families: Vec<u32>,
     pub(super) constructors: Vec<u32>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Order>() == 48);
 impl Order {
     pub(super) fn build(

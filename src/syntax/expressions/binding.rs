@@ -3,6 +3,7 @@ pub(crate) mod plan;
 use super::{ExprId, ExprKind, ExpressionError, Expressions};
 use crate::resource::{Budget, ResourceError};
 use crate::syntax::levels::{LevelNames, Levels};
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 /// Vector position zero denotes the nearest replaced/abstracted binder.
@@ -39,6 +40,7 @@ struct Entry {
     result: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 16);
 
 /// Completed (source, binder offset) -> result, for exactly one fixed operation,
@@ -155,10 +157,13 @@ impl Memo {
         release(std::mem::replace(&mut self.entries, next), b)
     }
 }
-fn release<T: Copy>(v: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: Copy + crate::resource::charged::Charged>(
+    v: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = v
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(v);
     b.release(bytes as u64)
@@ -168,6 +173,7 @@ enum Frame {
     Visit(ExprId, u32),
     Finish(ExprId, u32),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() <= 12);
 #[derive(Default)]
 struct Scratch {
@@ -572,4 +578,10 @@ fn memo_offset(op: Binding<'_>, source: ExprId, result: ExprId, offset: u32) -> 
     } else {
         offset
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 12,
+    Entry => 16,
 }

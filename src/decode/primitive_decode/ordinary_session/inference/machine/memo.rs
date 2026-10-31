@@ -47,11 +47,13 @@ struct Entry {
     hash: u32,
     dependencies: u64,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 32);
 #[derive(Default)]
 pub(super) struct Memo {
     entries: Vec<Entry>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Memo>() == 24);
 impl Memo {
     // Bucket zero is the count header; all other buckets form one shared table.
@@ -224,7 +226,7 @@ impl Memo {
                 .ok_or(ResourceError::Invariant)
         })();
         let frames = stack.len();
-        let bytes = (stack.capacity() * size_of::<ExprId>()) as u64;
+        let bytes = (stack.capacity() * crate::resource::charged::bytes::<ExprId>()) as u64;
         drop(stack);
         let a = work.budget.release_frames(frames);
         let b = work.budget.release(bytes);
@@ -394,7 +396,7 @@ impl Memo {
             .checked_add(1)
             .ok_or(ResourceError::Counter)?;
         let bytes = cap
-            .checked_mul(size_of::<Entry>())
+            .checked_mul(crate::resource::charged::bytes::<Entry>())
             .ok_or(ResourceError::Counter)? as u64;
         // No allocation or semantic reservation until BOTH complete peak checks
         // pass. Old table capacity remains charged throughout replacement.
@@ -440,7 +442,7 @@ fn release(
 ) -> Result<(), ResourceError> {
     let bytes = entries
         .capacity()
-        .checked_mul(size_of::<Entry>())
+        .checked_mul(crate::resource::charged::bytes::<Entry>())
         .ok_or(ResourceError::Counter)? as u64;
     drop(entries);
     let a = session.release(bytes);
@@ -470,4 +472,9 @@ fn dependency_push(
     }
     stack.push(id);
     Ok(())
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 32,
 }

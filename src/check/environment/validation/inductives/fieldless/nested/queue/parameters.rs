@@ -20,7 +20,9 @@ struct Prefix {
     name: NameId,
     annotation: BinderInfo,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Parameter>() == 20);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Prefix>() == 12);
 
 #[derive(Default)]
@@ -249,4 +251,10 @@ fn substitute(root: ExprId, argument: ExprId, work: &mut Working<'_>) -> Result<
         work.names,
         work.budget,
     )?)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Prefix => 12,
+    Parameter => 20,
 }

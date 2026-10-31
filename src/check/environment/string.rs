@@ -28,6 +28,7 @@ pub(super) struct Certificate {
     modulus_slot: u32,
     modulus_frontier: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Certificate>() == 152);
 // Zero-based referent indices in the generated inventory, in retained-slot order:
 // String, String.ofList, List, List.nil, List.cons, Char, Char.ofNat.

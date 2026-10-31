@@ -3,7 +3,9 @@
 //! Binding slots are opaque caller-owned values, not reusable local identities.
 //! No handle interning or cross-store equivalence is supplied here.
 use crate::resource::{Budget, ResourceError};
-use std::{cell::Cell, mem::size_of};
+use std::cell::Cell;
+#[cfg(target_pointer_width = "64")]
+use std::mem::size_of;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub(crate) struct EnvId(u32);
@@ -41,10 +43,15 @@ pub(crate) struct Environment {
     blocks: Vec<Block>,
     failure: Cell<Option<ResourceError>>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<EnvId>() == 4);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<BindingId>() == 4);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Root>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Block>() == 128);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Environment>() <= 56);
 
 impl Environment {
@@ -259,10 +266,16 @@ impl Environment {
     }
     pub(crate) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
         let failure = self.failure.get();
-        let bytes =
-            self.roots.capacity() * size_of::<Root>() + self.blocks.capacity() * size_of::<Block>();
+        let bytes = self.roots.capacity() * crate::resource::charged::bytes::<Root>()
+            + self.blocks.capacity() * crate::resource::charged::bytes::<Block>();
         drop(self);
         b.release(bytes as u64)?;
         failure.map_or(Ok(()), Err)
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Root => 12,
+    Block => 128,
 }

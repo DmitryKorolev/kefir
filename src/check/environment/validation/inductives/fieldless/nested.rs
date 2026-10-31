@@ -5,6 +5,7 @@
 //! translation, matching the reference kernel's pre-elimination scan.
 use super::*;
 use crate::decode::primitive_decode::ordinary_session::Negative;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 mod publication;
 mod queue;
@@ -267,7 +268,7 @@ impl State {
         })();
         let retirement = order.retire(work.budget);
         work.record_nested_retirement(retirement);
-        let bytes = names.capacity() * std::mem::size_of::<NameId>();
+        let bytes = names.capacity() * crate::resource::charged::bytes::<NameId>();
         drop(names);
         let retirement = work.budget.release(bytes as u64);
         work.record_nested_retirement(retirement);

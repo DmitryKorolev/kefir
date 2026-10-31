@@ -12,6 +12,7 @@ pub(super) struct Entry {
     pub(super) value: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 12);
 /// Exact u32-key map. Separate instances hold canonical-name replacements and
 /// completed original-source results. Both die with the fixed substitution.
@@ -132,6 +133,7 @@ struct Frame {
     first: LevelId,
     second: bool,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Frame>() == 12);
 pub(crate) struct Substitution<'h, 'a, N, const CACHED: bool = true> {
     h: &'h mut Helpers<'a, N>,
@@ -327,3 +329,9 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
 }
 
 pub(crate) mod expressions;
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 12,
+    Frame => 12,
+}

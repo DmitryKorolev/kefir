@@ -33,7 +33,9 @@ pub(super) struct Fields {
     pub(super) name: NameId,
     pub(super) ty: ExprId,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Fields>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Request<'_>>() == 32);
 // No additional Scratch owner: ordered parameters use its existing budgeted
 // declaration vector, four bytes per NameId plus charged capacity slack. Serde

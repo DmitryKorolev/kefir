@@ -16,6 +16,7 @@ pub(crate) struct Counts {
     pub accounting: [u64; 4],
     pub events: [u64; 11],
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Counts>() == 120);
 
 #[derive(Clone, Copy, Default)]
@@ -32,6 +33,7 @@ pub(crate) struct Declaration {
     pub name: Span,
     pub counts: Counts,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Declaration>() == 136);
 
 fn next_count(len: usize, ordinal: u64) -> Option<usize> {

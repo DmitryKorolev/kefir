@@ -145,6 +145,25 @@ report, including `sorryAx`. This option does not verify native computations.
 Keep the selected policy with the command or run configuration; the report alone
 does not identify the policy.
 
+### WebAssembly
+
+kefir also builds for `wasm32-wasip1` and runs under Node.js's WASI on one thread.
+It checks with the same code and charges the same resource budgets as the native
+build, so its reports differ only in the build identity. It needs the target's
+standard library and Node.js 24 (tested with 24.16):
+
+```sh
+rustup target add wasm32-wasip1
+scripts/wasm/build.sh
+node scripts/wasm/run-wasm.mjs target/wasm32-wasip1/release/kefir.wasm \
+  path/to/export.ndjson --axiom-policy=allow-all-declared-axioms
+```
+
+The runner takes the export as an argument instead of `IN` and passes kefir's exit
+code through. A trap, an engine-stack overflow or any other host failure exits 3,
+never a verdict. The wasm build can address at most 4 GiB of memory. An input
+that needs more ends with an internal failure (exit 3), never a verdict.
+
 ## Resource limits
 
 Resource budgets are part of checking and are fixed in this release. Exhausting a budget

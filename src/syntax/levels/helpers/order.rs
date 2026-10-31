@@ -9,6 +9,7 @@ enum Frame {
     Nodes(LevelId, LevelId),
     Offsets(u32, u32),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Frame>() <= 12);
 
 fn push(stack: &mut Vec<Frame>, f: Frame, b: &mut Budget) -> Result<(), ResourceError> {
@@ -100,4 +101,9 @@ impl<N: OrderedLevelNames> Helpers<'_, N> {
         self.budget.release_frames(frames)?;
         result
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Frame => 12,
 }

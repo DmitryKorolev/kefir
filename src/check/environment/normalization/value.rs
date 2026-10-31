@@ -17,6 +17,7 @@ const MAX_FORCE_CALLS: u32 = 400_000;
 // Independent premises share an inherited producer path; sequential forcing
 // still extends it. The charged worklist stores twelve bytes per pair.
 type ComparisonPair = (u32, u32, ReductionPath);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ComparisonPair>() == 12);
 
 #[derive(Clone, Copy, Debug)]
@@ -151,10 +152,13 @@ impl Table {
     }
 }
 
-fn release<T>(values: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: crate::resource::charged::Charged>(
+    values: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(values);
     b.release(bytes as u64)
@@ -1074,6 +1078,25 @@ pub(crate) fn try_equal(
     }
     let depth = a.depth().max(z.depth());
     let limit_override = depth_limit_override();
+    // wasm32-wasip1 has no threads: the deep comparison runs on the
+    // single stack with the same depth limit as the spawned thread.
+    #[cfg(target_family = "wasm")]
+    if depth > 256 && limit_override.is_none() {
+        return try_equal_inner(
+            left,
+            right,
+            incoming,
+            scope,
+            declarations,
+            expressions,
+            levels,
+            names,
+            budget,
+            session_force_calls,
+            MAX_VALUE_DEPTH,
+        );
+    }
+    #[cfg(not(target_family = "wasm"))]
     if depth > 256 && limit_override.is_none() {
         return std::thread::scope(|scope_thread| {
             let fail_spawn = false;
@@ -1174,4 +1197,12 @@ fn try_equal_inner(
         Err(EvaluationError::Use(UseError::Unavailable | UseError::UnsafeUse)) => Ok(None),
         Err(EvaluationError::Use(error)) => Err(error.into()),
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 16,
+    Value => 12,
+    Binding => 12,
+    Argument => 12,
 }

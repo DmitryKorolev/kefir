@@ -105,7 +105,9 @@ pub(crate) struct Level {
     flags: u32,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<LevelKind>() == 12);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Level>() == 24);
 
 impl Level {
@@ -349,4 +351,11 @@ impl Levels {
 fn mix(tag: u32, a: u32, b: u32) -> u32 {
     let x = tag.wrapping_add(0x9e37_79b9) ^ a.rotate_left(7) ^ b.rotate_left(19);
     x.wrapping_mul(0x85eb_ca6b) ^ (x >> 13)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    LevelId => 4,
+    NameId => 4,
+    Level => 24,
 }

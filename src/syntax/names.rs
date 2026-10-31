@@ -5,6 +5,7 @@ use crate::resource::{Budget, ResourceError, STRUCTURE_DEPTH};
 use crate::syntax::levels::{LevelNames, NameId, NameSummary, OrderedLevelNames};
 use std::cmp::Ordering;
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[cfg(feature = "introspection")]
@@ -48,6 +49,7 @@ struct Name {
     len: u32,
     depth: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Name>() == 24);
 
 #[derive(Clone, Copy, Default)]
@@ -55,6 +57,7 @@ struct Entry {
     hash: u64,
     name: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 16);
 
 /// Raw nodes remain distinct; the canonical table references the first raw
@@ -529,11 +532,20 @@ impl OrderedLevelNames for Names {
     }
 }
 
-fn release<T: Copy>(v: Vec<T>, b: &mut Budget) -> Result<(), ResourceError> {
+fn release<T: Copy + crate::resource::charged::Charged>(
+    v: Vec<T>,
+    b: &mut Budget,
+) -> Result<(), ResourceError> {
     let bytes = v
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)?;
     drop(v);
     b.release(bytes as u64)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Name => 24,
+    Entry => 16,
 }

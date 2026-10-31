@@ -29,6 +29,7 @@ pub(super) enum Completed {
     Comparison(comparison::Decision),
     Finite(finite::Reply),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Completed>() == 24);
 enum Owner {
     Inference(machine::Machine),
@@ -44,6 +45,7 @@ struct Job {
 }
 // The largest owner stays comparison-sized in both builds. Its enum niche
 // and the incoming depth keep semantic allocation at 240 bytes per job.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Job>() == 240);
 enum Step {
     More,
@@ -991,7 +993,7 @@ pub(super) fn run(
     ]);
     let bytes = descendants
         .capacity()
-        .checked_mul(size_of::<Job>())
+        .checked_mul(crate::resource::charged::bytes::<Job>())
         .ok_or(ResourceError::Counter);
     drop(descendants);
     failure = machine::select_failure([
@@ -1013,4 +1015,9 @@ pub(super) fn run(
         Some(error) => Err(error),
         None => result,
     }
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Job => 240,
 }

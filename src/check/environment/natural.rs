@@ -9,6 +9,7 @@ use crate::syntax::names::Component;
 #[derive(Clone, Copy, Default)]
 // Minimum committed frontier, original Nat/zero/succ names, original zero type.
 pub(super) struct Certificate(pub(super) [u32; 5]);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Certificate>() == 20);
 fn named(
     name: NameId,

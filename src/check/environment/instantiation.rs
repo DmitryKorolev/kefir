@@ -7,6 +7,7 @@ use crate::resource::{Budget, ResourceError, SessionCacheBudget};
 use crate::syntax::expressions::{ExprId, Expressions};
 use crate::syntax::levels::LevelId;
 use std::hash::Hasher;
+#[cfg(target_pointer_width = "64")]
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Default)]
@@ -17,7 +18,9 @@ struct Entry {
     len: u32,
     hash: u32,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Entry>() == 20);
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<LevelId>() == 4);
 
 /// No source or result survives driver retirement or source-frontier changes.
@@ -32,6 +35,7 @@ pub(crate) struct Cache {
     stopped: bool,
     prefixes: prefix::Cache,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Cache>() == 88);
 impl Cache {
     /// Raw completed beta reuse; the caller supplies the validated fixed prefix.
@@ -235,10 +239,10 @@ impl Cache {
             0
         };
         let bytes = entry_cap
-            .checked_mul(size_of::<Entry>())
+            .checked_mul(crate::resource::charged::bytes::<Entry>())
             .and_then(|n| {
                 argument_cap
-                    .checked_mul(size_of::<u32>())
+                    .checked_mul(crate::resource::charged::bytes::<u32>())
                     .and_then(|m| n.checked_add(m))
             })
             .ok_or(ResourceError::Counter)? as u64;
@@ -318,13 +322,13 @@ impl Cache {
         entries.and(arguments).and(prefixes)
     }
 }
-fn allocate<T>(
+fn allocate<T: crate::resource::charged::Charged>(
     cap: usize,
     session: &mut SessionCacheBudget,
     b: &mut Budget,
 ) -> Result<Vec<T>, ResourceError> {
     let bytes = cap
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)? as u64;
     if !session.reserve(bytes)? {
         return Err(ResourceError::Invariant);
@@ -336,17 +340,22 @@ fn allocate<T>(
     }
     Ok(next)
 }
-fn release<T>(
+fn release<T: crate::resource::charged::Charged>(
     values: Vec<T>,
     session: &mut SessionCacheBudget,
     b: &mut Budget,
 ) -> Result<(), ResourceError> {
     let bytes = values
         .capacity()
-        .checked_mul(size_of::<T>())
+        .checked_mul(crate::resource::charged::bytes::<T>())
         .ok_or(ResourceError::Counter)? as u64;
     drop(values);
     let a = session.release(bytes);
     let c = b.release(bytes);
     a.and(c)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Entry => 20,
 }

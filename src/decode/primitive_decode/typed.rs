@@ -102,12 +102,14 @@ enum RefState {
     Parsed(u32),
     Resolved(u32),
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<RefState>() == std::mem::size_of::<Option<u32>>());
 
 struct Ref<'a> {
     raw: Nat<'a>,
     slot: Cell<RefState>,
 }
+#[cfg(target_pointer_width = "64")]
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Ref<'_>>() == 24);
 
@@ -368,7 +370,8 @@ impl Check for Metadata<'_> {
         // from the extra-field rule; duplicate keys, Unicode, depth and
         // resource rules still apply to it. Preserving it verbatim
         // requires the object shape before any node exists.
-        integrity::validate_payload(self.f_data.get().as_bytes(), b)
+        // The root and mdata objects already occupy two container levels.
+        integrity::validate_payload(self.f_data.get().as_bytes(), 2, b)
     }
 }
 type Axiom<'a> = ObjectOnly<AxiomFields<'a>>;

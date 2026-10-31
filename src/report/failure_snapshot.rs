@@ -236,6 +236,7 @@ pub(crate) struct Snapshot {
     mismatch: Option<(u32, u32)>,
     truncated: Truncated,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Snapshot>() == 2_768);
 
 impl Snapshot {

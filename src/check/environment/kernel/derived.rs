@@ -184,6 +184,7 @@ struct Rule {
     leaf: Leaf,
 }
 // A template leaf is an index, so templates do not widen every rule.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Rule>() == 32);
 #[derive(Clone, Copy)]
 struct Tree {
@@ -523,8 +524,7 @@ impl Kernel<'_, '_> {
         match h {
             Head::Nat(n) if n != 0 => Ok((n - 1) | NAT),
             Head::BigNat(n) => {
-                let lit = self.nats[n as usize].dup()?;
-                let pred = nat_pred(&lit, self.b, &mut self.reserved)?;
+                let pred = nat_pred(&self.nats[n as usize], self.b, &mut self.reserved)?;
                 Ok(u64::from(self.nat(pred)?))
             }
             Head::Ctor { spine, .. } => {
@@ -1644,4 +1644,13 @@ impl Kernel<'_, '_> {
 /// Charge room for `n` more rules in the attempt's rule store.
 fn room_for(k: &mut Kernel<'_, '_>, n: usize) -> R<()> {
     room(k.b, &mut k.reserved, &mut k.derived.rules, n)
+}
+
+// Charged sizes (64-bit layout) of this module's stored types.
+crate::resource::charged::charged! {
+    Rule => 32,
+    TItem => 12,
+    TNode => 28,
+    Template => 20,
+    Tree => 12,
 }

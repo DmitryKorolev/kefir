@@ -98,6 +98,7 @@ impl Rejection {
     }
 }
 // Includes the exact Nat.div/Nat.mod frontiers.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     std::mem::size_of::<Complete>()
         == 896 + std::mem::size_of::<super::theorem_judgments::Judgments>()
@@ -136,6 +137,7 @@ pub(crate) struct Stopped {
     pub declaration: Option<std::num::NonZeroU64>,
     pub kind: Option<DeclarationKind>,
 }
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Stopped>() <= 128);
 impl Stopped {
     fn new(cause: Mapped<FailureReport>) -> Self {
