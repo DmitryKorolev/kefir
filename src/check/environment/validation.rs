@@ -353,6 +353,9 @@ impl State {
                             return Ok(());
                         }
                     }
+                    if super::kernel::different_theorem(&self.environment,request,&kernel_scope,work.names,work.expressions,work.levels,work.budget).map_err(Stop::Normalization)? {
+                        return Err(Stop::Judgment(crate::decode::primitive_decode::ordinary_session::Negative::TypeMismatch))
+                    }
                     let (value, ty) = if request.kind == Kind::Theorem {
                         let (value, ty) =
                             work.copy_theorem(request.value.ok_or(Stop::Unsupported)?, request.ty)?;

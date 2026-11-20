@@ -331,7 +331,12 @@ impl Retention {
     }
 
     pub(super) fn capture(&mut self, k: &mut Kernel<'_, '_>) -> R<()> {
-        if k.markers != 0 || !k.binders.is_empty() || !k.free_values.is_empty() || k.wants_quot {
+        if !k.natural_store.is_empty()
+            || k.markers != 0
+            || !k.binders.is_empty()
+            || !k.free_values.is_empty()
+            || k.wants_quot
+        {
             return Ok(());
         }
         if !self.slot.is_empty() || self.published {

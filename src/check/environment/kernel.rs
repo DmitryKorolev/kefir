@@ -39,7 +39,9 @@ use std::hash::BuildHasherDefault;
 use std::mem::size_of;
 use std::num::NonZeroU32;
 
+mod declaration_witness;
 mod derived;
+pub(super) use declaration_witness::different as different_theorem;
 pub(super) mod negative;
 mod read_large;
 mod retention;
@@ -1048,11 +1050,17 @@ struct LInst {
     next: u32,
 }
 
+mod natural_store;
+use natural_store::{Recipe, Store};
 enum NatLit {
     Small(u64),
     /// Canonical decimal digits of a value above `u64::MAX`.
     Big(Vec<u8>),
-    Computed(Box<[crate::check::natural::BinaryNat; 1]>),
+    Computed(
+        Box<[crate::check::natural::BinaryNat; 1]>,
+        std::cell::Cell<u64>,
+    ),
+    Evicted(Recipe),
 }
 
 /// Capacity reused across declaration attempts on one thread. Contents are
@@ -1126,6 +1134,7 @@ pub(crate) struct Kernel<'e, 'w> {
     linst_levels: Vec<LevelId>,
     linst_index: Map<u64, u32>,
     nats: Vec<NatLit>,
+    natural_store: Store,
     /// Let-bound fold restriction: two bits per value ID, set
     /// only for let-bound thunks. Bit `2v` marks a let-bound value; bit
     /// `2v + 1` records that reducing it exceeded `LET_FOLD_BUDGET` with the
@@ -1289,6 +1298,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             linst_levels: Vec::new(),
             linst_index: Map::default(),
             nats: Vec::new(),
+            natural_store: Store::default(),
             let_marks: Vec::new(),
             memo: a.memo,
             clo_index: a.clo_index,
@@ -1571,7 +1581,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             Val::Str(e) => (10, e.slot(), 0, 0, 0),
             Val::Nat(n) => match self.nats[n as usize] {
                 NatLit::Small(x) => (9, x as u32, (x >> 32) as u32, 0, 0),
-                NatLit::Big(_) | NatLit::Computed(_) => return None,
+                NatLit::Big(_) | NatLit::Computed(..) | NatLit::Evicted(_) => return None,
             },
             _ => return None,
         })
@@ -3585,15 +3595,12 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 return Ok(None);
             }
             if let Some(x) = self.nat_value_in(arg, lazy)? {
+                self.observe_natural(x, NONE)?;
                 let next = match nat_literal(&self.nats, x) {
                     NatLit::Small(n) if *n < u64::MAX => NatLit::Small(n + 1),
-                    x @ NatLit::Computed(_) => computed_nat(
-                        crate::check::natural::Operation::Add,
-                        x,
-                        &NatLit::Small(1),
-                        self.b,
-                        &mut self.reserved,
-                    )?,
+                    NatLit::Computed(..) => {
+                        return self.adjacent_computed(x, Operation::Add).map(Some);
+                    }
                     other => {
                         let d = nat_digits(other)?;
                         match crate::check::natural::successor(d.as_bytes(), self.b) {
@@ -3639,6 +3646,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         };
         // Both recursive observations are complete before borrowing digits.
         // Literal entries are immutable and cannot retire within this attempt.
+        self.observe_pair(x, y)?;
         let Some(op) = op else {
             let equality = pred == Some(true);
             let order = compare_naturals(
@@ -3665,11 +3673,16 @@ impl<'e, 'w> Kernel<'e, 'w> {
         if op == crate::check::natural::Operation::Gcd {
             self.steps_by(129)?;
         }
+        let recipe = Recipe {
+            op,
+            left: x,
+            right: y,
+        };
         let (x, y) = (nat_literal(&self.nats, x), nat_literal(&self.nats, y));
         let r = match nat_small(op, x, y) {
             Some(r) => NatLit::Small(r),
             None if use_binary_operation(op, x, y) => {
-                computed_nat(op, x, y, self.b, &mut self.reserved)?
+                return self.store_product(recipe).map(Some);
             }
             None => {
                 let (xs, ys) = (nat_digits(x)?, nat_digits(y)?);
@@ -3815,15 +3828,15 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 && let Some((nat, zero, succ)) = self.nat_ctors()?
                 && self.const_view(nat)?.canon == rec.family
             {
+                self.observe_natural(n, NONE)?;
                 major = match &self.nats[n as usize] {
                     NatLit::Small(0) => self.push(Val::Const {
                         ci: zero,
                         li: 0,
                         spine: 0,
                     })?,
-                    lit => {
-                        let pred = nat_pred(lit, self.b, &mut self.reserved)?;
-                        let pred = self.nat(pred)?;
+                    _ => {
+                        let pred = self.predecessor_value(n)?;
                         let spine = self.cell(0, pred, 0)?;
                         self.push(Val::Const {
                             ci: succ,
@@ -5113,6 +5126,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         Ok(Some(match (self.vals[a as usize], self.vals[c as usize]) {
             (Val::Sort(x), Val::Sort(y)) => self.level_eq(x, y)?,
             (Val::Nat(x), Val::Nat(y)) => {
+                self.observe_pair(x, y)?;
                 nat_eq(&self.nats[x as usize], &self.nats[y as usize], self.b)?
             }
             (Val::Str(x), Val::Str(y)) => {
@@ -6425,6 +6439,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 (Some((fa, ia)), Some((fb, ib))) if fa == fb && ia != ib
             ),
             (Val::Nat(a), Val::Nat(b)) => {
+                self.observe_pair(a, b)?;
                 !nat_eq(&self.nats[a as usize], &self.nats[b as usize], self.b)?
             }
             _ => false,
@@ -6637,6 +6652,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let Val::Const { ci, spine, .. } = self.vals[other as usize] else {
             return Ok(false);
         };
+        self.observe_natural(n, NONE)?;
         let lit = &self.nats[n as usize];
         if ci == zero && spine == 0 {
             return Ok(matches!(lit, NatLit::Small(0)));
@@ -6645,8 +6661,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             let Some(arg) = self.arg_item(spine) else {
                 return Ok(false);
             };
-            let p = nat_pred(lit, self.b, &mut self.reserved)?;
-            let p = self.nat(p)?;
+            let p = self.predecessor_value(n)?;
             return self.defeq(p, arg);
         }
         Ok(false)
@@ -6823,7 +6838,7 @@ fn nat_digits(n: &NatLit) -> R<NatDigits<'_>> {
             NatDigits::Small { bytes, start }
         }
         NatLit::Big(bytes) => NatDigits::Big(bytes),
-        NatLit::Computed(_) => return Err(ResourceError::Invariant.into()),
+        NatLit::Computed(..) | NatLit::Evicted(_) => return Err(ResourceError::Invariant.into()),
     })
 }
 
@@ -6831,7 +6846,7 @@ use crate::check::natural::{BinaryNat, Operation};
 
 fn use_binary_operation(op: Operation, left: &NatLit, right: &NatLit) -> bool {
     let wide = |n: &NatLit| {
-        matches!(n, NatLit::Computed(_)) || matches!(n, NatLit::Big(digits) if digits.len() > 600)
+        matches!(n, NatLit::Computed(..)) || matches!(n, NatLit::Big(digits) if digits.len() > 600)
     };
     wide(left)
         || wide(right)
@@ -6853,7 +6868,8 @@ fn binary_operand<'a>(
     use std::borrow::Cow;
     Ok(match n {
         NatLit::Small(x) => Cow::Owned(BinaryNat::small(*x)),
-        NatLit::Computed(x) => Cow::Borrowed(&x[0]),
+        NatLit::Evicted(_) => return Err(ResourceError::Invariant.into()),
+        NatLit::Computed(x, _) => Cow::Borrowed(&x[0]),
         NatLit::Big(bytes) => Cow::Owned(
             crate::check::natural::parse_binary(bytes, budget, scratch).map_err(binary_error)?,
         ),
@@ -6898,13 +6914,14 @@ fn computed_nat(
                 slot.into_boxed_slice()
                     .try_into()
                     .map_err(|_| ResourceError::Invariant)?,
+                std::cell::Cell::new(0),
             )
         }
     })
 }
 
 fn compare_naturals(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<std::cmp::Ordering> {
-    if matches!(a, NatLit::Computed(_)) || matches!(b, NatLit::Computed(_)) {
+    if matches!(a, NatLit::Computed(..)) || matches!(b, NatLit::Computed(..)) {
         return with_binary_operands(a, b, budget, |a, b, budget| Ok(a.compare(b, budget)?));
     }
     let (x, y) = (nat_digits(a)?, nat_digits(b)?);
@@ -6915,9 +6932,12 @@ fn compare_naturals(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<std::cmp::
 
 fn nat_eq(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<bool> {
     Ok(match (a, b) {
+        (NatLit::Evicted(_), _) | (_, NatLit::Evicted(_)) => {
+            return Err(ResourceError::Invariant.into());
+        }
         (NatLit::Small(x), NatLit::Small(y)) => x == y,
         (NatLit::Big(x), NatLit::Big(y)) => x == y,
-        (NatLit::Computed(_), _) | (_, NatLit::Computed(_)) => {
+        (NatLit::Computed(..), _) | (_, NatLit::Computed(..)) => {
             compare_naturals(a, b, budget)?.is_eq()
         }
         _ => false,
@@ -6925,8 +6945,9 @@ fn nat_eq(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<bool> {
 }
 fn nat_pred(n: &NatLit, budget: &mut Budget, reserved: &mut u64) -> R<NatLit> {
     match n {
+        NatLit::Evicted(_) => Err(ResourceError::Invariant.into()),
         NatLit::Small(v) => Ok(NatLit::Small(v - 1)),
-        x @ NatLit::Computed(_) => {
+        x @ NatLit::Computed(..) => {
             computed_nat(Operation::Sub, x, &NatLit::Small(1), budget, reserved)
         }
         // This is the sole canonical big input whose predecessor is small.

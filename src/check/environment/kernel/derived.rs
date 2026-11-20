@@ -545,10 +545,7 @@ impl Kernel<'_, '_> {
     fn field(&mut self, g: Guard, h: Head, k: u8) -> R<Arg> {
         match h {
             Head::Nat(n) if n != 0 => Ok((n - 1) | NAT),
-            Head::BigNat(n) => {
-                let pred = nat_pred(&self.nats[n as usize], self.b, &mut self.reserved)?;
-                Ok(u64::from(self.nat(pred)?))
-            }
+            Head::BigNat(n) => Ok(u64::from(self.predecessor_value(n)?)),
             Head::Ctor { spine, .. } => {
                 // Constructor arguments are params then fields, root first.
                 let len = self.cells[spine as usize].len;
@@ -1610,6 +1607,7 @@ impl Kernel<'_, '_> {
                     }
                 }
                 (Val::Nat(p), Val::Nat(q)) => {
+                    self.observe_pair(p, q)?;
                     let equal = nat_eq(&self.nats[p as usize], &self.nats[q as usize], self.b)?;
                     if !equal {
                         return Ok(false);

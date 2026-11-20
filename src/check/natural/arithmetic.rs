@@ -349,7 +349,6 @@ pub(crate) struct BinaryNat(Magnitude);
 enum Magnitude {
     Small(u64),
     Big(BigUint),
-    Packed { limbs: usize, words: Vec<u32> },
 }
 
 impl BinaryNat {
@@ -363,52 +362,12 @@ impl BinaryNat {
         }
     }
 
-    fn operand(
-        &self,
-        budget: &mut Budget,
-        scratch: &mut u64,
-    ) -> Result<std::borrow::Cow<'_, BigUint>, ResourceError> {
+    fn operand(&self) -> std::borrow::Cow<'_, BigUint> {
         use std::borrow::Cow;
-        Ok(match &self.0 {
+        match &self.0 {
             Magnitude::Small(n) => Cow::Owned(BigUint::from(*n)),
             Magnitude::Big(n) => Cow::Borrowed(n),
-            Magnitude::Packed { limbs, words } => {
-                let length = *limbs as u64;
-                budget.charge_work(32 * (length + 4))?;
-                reserve_more(32 * (length + 4), scratch, budget)?;
-                let mut digits = Vec::new();
-                digits
-                    .try_reserve_exact(*limbs)
-                    .map_err(|_| ResourceError::Allocation)?;
-                let mut data = words.as_slice();
-                while digits.len() < *limbs {
-                    let (&mask, rest) = data.split_first().ok_or(ResourceError::Invariant)?;
-                    let width = 32.min(*limbs - digits.len());
-                    let (block, next) = rest
-                        .split_at_checked(mask.count_ones() as usize)
-                        .ok_or(ResourceError::Invariant)?;
-                    data = next;
-                    let start = digits.len();
-                    if mask == u32::MAX && width == 32 {
-                        digits.extend_from_slice(block);
-                    } else {
-                        digits.resize(start + width, 0);
-                        let mut bits = mask;
-                        for &word in block {
-                            let index = bits.trailing_zeros() as usize;
-                            *digits
-                                .get_mut(start + index)
-                                .ok_or(ResourceError::Invariant)? = word;
-                            bits &= bits - 1;
-                        }
-                    }
-                }
-                if !data.is_empty() {
-                    return Err(ResourceError::Invariant);
-                }
-                Cow::Owned(BigUint::new(digits))
-            }
-        })
+        }
     }
 
     pub(crate) fn compare(
@@ -423,15 +382,11 @@ impl BinaryNat {
             (_, Magnitude::Small(_)) => return Ok(Ordering::Greater),
             _ => {}
         }
-        let mut scratch = 0;
-        let result = (|| {
-            let a = self.operand(budget, &mut scratch)?;
-            let b = rhs.operand(budget, &mut scratch)?;
-            budget.charge_work(a.bits().min(b.bits()).div_ceil(32) + 1)?;
-            Ok(a.cmp(&b))
-        })();
-        budget.release(scratch)?;
-        result
+        let (Magnitude::Big(a), Magnitude::Big(b)) = (&self.0, &rhs.0) else {
+            return Err(ResourceError::Invariant);
+        };
+        budget.charge_work(a.bits().min(b.bits()).div_ceil(32) + 1)?;
+        Ok(a.cmp(b))
     }
 }
 
@@ -443,35 +398,6 @@ fn keep_binary(result: &BigUint, b: &mut Budget, retained: &mut u64) -> Result<B
     // The portable envelope covers the minimum allocation and rounding to a
     // machine digit on both targets.
     let limbs = result.bits().div_ceil(32);
-    if limbs > 256 {
-        b.charge_work(32 * (limbs + 4))?;
-        let count = result.iter_u32_digits().filter(|&digit| digit != 0).count() as u64
-            + limbs.div_ceil(32);
-        if count <= limbs - limbs.div_ceil(8) {
-            reserve_more(4 * count, retained, b)?;
-            let mut words = Vec::new();
-            words
-                .try_reserve_exact(usize::try_from(count).map_err(|_| ResourceError::Storage)?)
-                .map_err(|_| ResourceError::Allocation)?;
-            let mut digits = result.iter_u32_digits();
-            while digits.len() != 0 {
-                let mask_at = words.len();
-                words.push(0);
-                let mut mask = 0;
-                for (bit, digit) in digits.by_ref().take(32).enumerate() {
-                    if digit != 0 {
-                        mask |= 1 << bit;
-                        words.push(digit);
-                    }
-                }
-                words[mask_at] = mask;
-            }
-            return Ok(BinaryNat(Magnitude::Packed {
-                limbs: usize::try_from(limbs).map_err(|_| ResourceError::Storage)?,
-                words,
-            }));
-        }
-    }
     b.charge_work(limbs + 1)?;
     reserve_more(plans::mul(&[8, limbs + 4])?, retained, b)?;
     Ok(BinaryNat(Magnitude::Big(result.clone())))
@@ -503,8 +429,8 @@ pub(crate) fn binary_arithmetic(
     let mut scratch = 0;
     reserve_more(64, &mut scratch, b)?;
     let result = (|| {
-        let a = left.operand(b, &mut scratch)?;
-        let z = right.operand(b, &mut scratch)?;
+        let a = left.operand();
+        let z = right.operand();
         let (ab, bb) = (a.bits(), z.bits());
         let product_bits = ab.checked_mul(u64::try_from(z.as_ref()).unwrap_or(u64::MAX));
         let value = if op == Operation::Pow
@@ -528,11 +454,11 @@ pub(crate) fn binary_arithmetic(
             }
             value
         } else {
-            let (action, space, work) = if op == Operation::Mul
+            let asymmetric = op == Operation::Mul
                 && ab.min(bb) > 0
                 && ab.min(bb) <= 1024
-                && ab.max(bb) > SCALAR_FORMAT_BITS
-            {
+                && ab.max(bb) > SCALAR_FORMAT_BITS;
+            let (action, space, work) = if asymmetric {
                 // The shorter operand has at most 32 portable digits. This
                 // selects a schoolbook leaf even for an asymmetric wide pair.
                 let s = plans::add(&[ab.div_ceil(32), bb.div_ceil(32)])?;
@@ -546,10 +472,67 @@ pub(crate) fn binary_arithmetic(
             };
             b.charge_work(work)?;
             reserve_more(space, &mut scratch, b)?;
-            apply(action, &a, &z)
+            if asymmetric {
+                let (long, short) = if ab >= bb { (&*a, &*z) } else { (&*z, &*a) };
+                separated_product(long, short, b)?.unwrap_or_else(|| apply(action, &a, &z))
+            } else {
+                apply(action, &a, &z)
+            }
         };
         keep_binary(&value, b, retained)
     })();
     b.release(scratch)?;
     result
+}
+
+/// Each set bit in `long` contributes one shifted copy of `short`.
+/// Disjoint bit ranges add with no carries; overlap abandons this shortcut.
+/// The caller has already reserved the full asymmetric multiplication envelope.
+fn separated_product(
+    long: &BigUint,
+    short: &BigUint,
+    b: &mut Budget,
+) -> Result<Option<BigUint>, Error> {
+    let width = short.bits();
+    let words = plans::add(&[long.bits(), width])?.div_ceil(32);
+    // A successful placement advances at least width bits. Charge each
+    // placement for initializing its digit iterator, copying and the carry.
+    // A late overlap still leaves all backend fallback work prepaid.
+    if width == 0 {
+        return Ok(Some(BigUint::from(0u32)));
+    }
+    let copies = long.bits().div_ceil(width);
+    let scan = plans::mul(&[128, words + 4])?;
+    let place = plans::mul(&[64, copies, width.div_ceil(32) + 1])?;
+    b.charge_work(plans::add(&[scan, place])?)?;
+    let length = usize::try_from(words).map_err(|_| ResourceError::Storage)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(length)
+        .map_err(|_| ResourceError::Allocation)?;
+    out.resize(length, 0u32);
+    let mut next = 0;
+    for (i, mut bits) in long.iter_u32_digits().enumerate() {
+        while bits != 0 {
+            let pos = 32 * i as u64 + u64::from(bits.trailing_zeros());
+            if pos < next {
+                return Ok(None);
+            }
+            next = pos + width;
+            let start = (pos / 32) as usize;
+            let shift = pos % 32;
+            let mut carry = 0;
+            let mut end = start;
+            for word in short.iter_u32_digits() {
+                let part = (u64::from(word) << shift) | carry;
+                out[end] |= part as u32;
+                carry = part >> 32;
+                end += 1;
+            }
+            if carry != 0 {
+                out[end] |= carry as u32
+            }
+            bits &= bits - 1;
+        }
+    }
+    Ok(Some(BigUint::new(out)))
 }

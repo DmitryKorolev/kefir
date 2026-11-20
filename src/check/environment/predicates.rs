@@ -90,6 +90,11 @@ fn slice<T>(values: &[T], span: GroupSpan) -> Result<&[T], ResourceError> {
         .ok_or(ResourceError::Invariant)
 }
 impl Environment {
+    pub(super) fn checked_le_name(&self) -> Option<NameId> {
+        let slot = self.predicates.0[2].checked_sub(1)?;
+        self.entries.get(slot as usize).map(|entry| entry.name)
+    }
+
     pub(super) fn prepare_predicate_definition(
         &self,
         request: &Request<'_>,
