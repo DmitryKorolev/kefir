@@ -1,13 +1,3 @@
-//! Two complete pinned Nat.div closures in the existing exact manifest.
-//! Generated
+//! Complete, independently matched reference closures.
 pub(super) const ROOT: usize = 110;
-pub(super) const CLOSURES: [[u32; 12]; 2] = [
-    [
-        3026759059, 957866137, 3991923136, 3263419370, 3027276866, 322854851, 2047574844,
-        943808552, 234389526, 1754907152, 3167580613, 102502396,
-    ],
-    [
-        3026759059, 153, 3991923136, 3263419370, 3027276866, 322854851, 2047574844, 943789576,
-        234389526, 1754907152, 3167580613, 102502396,
-    ],
-];
+pub(super) use super::manifest::DIV_CLOSURE_MASKS as CLOSURES;

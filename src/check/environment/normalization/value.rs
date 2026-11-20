@@ -95,22 +95,47 @@ impl Table {
         (h ^ (h >> 29)) as usize
     }
 
-    fn position(entries: &[Entry], tag: u32, left: u32, right: u32) -> Option<usize> {
-        let mask = entries.len().checked_sub(1)?;
+    fn position(
+        entries: &[Entry],
+        tag: u32,
+        left: u32,
+        right: u32,
+        b: &mut Budget,
+    ) -> Result<usize, ResourceError> {
+        let mask = entries
+            .len()
+            .checked_sub(1)
+            .ok_or(ResourceError::Invariant)?;
         let mut slot = Self::hash(tag, left, right) & mask;
-        for _ in 0..entries.len() {
-            let e = entries[slot];
-            if e.tag == 0 || (e.tag == tag && e.left == left && e.right == right) {
-                return Some(slot);
+        let mut remaining = entries.len();
+        let mut group = 1;
+        while remaining != 0 {
+            b.charge_work(group as u64)?;
+            for _ in 0..group {
+                let e = entries[slot];
+                if e.tag == 0 || (e.tag == tag && e.left == left && e.right == right) {
+                    return Ok(slot);
+                }
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
+            remaining -= group;
+            group = remaining.min(8);
         }
-        None
+        Err(ResourceError::Invariant)
     }
 
-    fn get(&self, tag: u32, left: u32, right: u32) -> Option<u32> {
-        let slot = Self::position(&self.entries, tag, left, right)?;
-        (self.entries[slot].tag != 0).then_some(self.entries[slot].result)
+    fn get(
+        &self,
+        tag: u32,
+        left: u32,
+        right: u32,
+        b: &mut Budget,
+    ) -> Result<Option<u32>, ResourceError> {
+        if self.entries.is_empty() {
+            return Ok(None);
+        }
+        let slot = Self::position(&self.entries, tag, left, right, b)?;
+        Ok((self.entries[slot].tag != 0).then_some(self.entries[slot].result))
     }
 
     fn insert(
@@ -122,23 +147,30 @@ impl Table {
         b: &mut Budget,
     ) -> Result<(), ResourceError> {
         if self.used + 1 > self.entries.len() * 3 / 4 {
-            let cap = self.entries.len().checked_mul(2).unwrap_or(0).max(32);
-            if cap == 0 {
-                return Err(ResourceError::Counter);
-            }
+            let cap = self
+                .entries
+                .len()
+                .checked_mul(2)
+                .ok_or(ResourceError::Counter)?
+                .max(32);
+            b.charge_work(cap as u64 + self.entries.len() as u64)?;
             let mut next = Vec::new();
             b.grow_vec(&mut next, cap)?;
             next.resize(cap, Entry::default());
             for e in self.entries.iter().copied().filter(|e| e.tag != 0) {
-                let slot = Self::position(&next, e.tag, e.left, e.right)
-                    .ok_or(ResourceError::Invariant)?;
+                let slot = match Self::position(&next, e.tag, e.left, e.right, b) {
+                    Ok(slot) => slot,
+                    Err(error) => {
+                        release(next, b)?;
+                        return Err(error);
+                    }
+                };
                 next[slot] = e;
             }
             let old = std::mem::replace(&mut self.entries, next);
             release(old, b)?;
         }
-        let slot =
-            Self::position(&self.entries, tag, left, right).ok_or(ResourceError::Invariant)?;
+        let slot = Self::position(&self.entries, tag, left, right, b)?;
         if self.entries[slot].tag == 0 {
             self.used += 1;
         }
@@ -249,7 +281,9 @@ impl Evaluator<'_, '_> {
         // environment and is not interned.
         let environment = self.scope_environment(needed, environment)?;
         if environment == NONE
-            && let Some(value) = self.table.get(1, expression.slot(), environment)
+            && let Some(value) = self
+                .table
+                .get(1, expression.slot(), environment, self.budget)?
         {
             return Ok(value);
         }
@@ -338,7 +372,7 @@ impl Evaluator<'_, '_> {
             self.values[head as usize],
             Value::Neutral { .. } | Value::Whnf { .. } | Value::Canonical { .. }
         );
-        if cacheable && let Some(result) = self.table.get(3, head, argument) {
+        if cacheable && let Some(result) = self.table.get(3, head, argument, self.budget)? {
             return Ok(result);
         }
         let result = match self.values[head as usize] {
@@ -692,7 +726,7 @@ impl Evaluator<'_, '_> {
         // This certificate belongs to the canonicalization operation on the
         // exact ordinary WHNF, not to the shared representative. Ordinary
         // forcing has already charged its own prefix and never reads tag 6.
-        if let Some(certificate) = self.table.get(6, major, NONE) {
+        if let Some(certificate) = self.table.get(6, major, NONE, self.budget)? {
             let Value::Complete { head, height } = self.values[certificate as usize] else {
                 return Err(ResourceError::Invariant.into());
             };
@@ -770,7 +804,7 @@ impl Evaluator<'_, '_> {
         } else {
             NONE
         };
-        if let Some(existing) = self.table.get(4, head.slot(), child) {
+        if let Some(existing) = self.table.get(4, head.slot(), child, self.budget)? {
             return Ok(existing);
         }
         let canonical = if arguments.len() == 1 {
@@ -877,7 +911,7 @@ impl Evaluator<'_, '_> {
             None
         };
         if let Some((function, major)) = cache_key
-            && let Some(cached) = self.table.get(5, function, major)
+            && let Some(cached) = self.table.get(5, function, major, self.budget)?
         {
             return self.force(cached);
         }

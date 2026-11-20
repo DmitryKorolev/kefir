@@ -412,6 +412,22 @@ impl Machine {
                     Err(HeadError::Unsupported) => {}
                     Err(error) => return Err(error),
                 }
+                if !self.inconclusive
+                    && let Some(evidence) = crate::check::environment::kernel::negative::different(
+                        environment,
+                        self.left,
+                        self.right,
+                        scope,
+                        locals,
+                        self.incoming,
+                        names,
+                        expressions,
+                        levels,
+                        budget,
+                    )?
+                {
+                    return self.finish(Decision::Different(evidence), locals, ledger, budget);
+                }
                 self.phase = Phase::Prefix;
             }
             if self.phase == Phase::Open {

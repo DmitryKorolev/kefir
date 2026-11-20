@@ -40,6 +40,7 @@ use std::mem::size_of;
 use std::num::NonZeroU32;
 
 mod derived;
+pub(super) mod negative;
 mod read_large;
 mod retention;
 pub(super) use retention::{Retention, select_cleanup};
@@ -344,6 +345,11 @@ struct MemoSlot {
     key: [u32; 4],
     val: u32,
 }
+struct MemoVacancy {
+    size: usize,
+    index: usize,
+    key: [u32; 4],
+}
 const MEMO_VACANT: MemoSlot = MemoSlot {
     key: [0; 4],
     val: NONE,
@@ -387,21 +393,64 @@ impl Exact {
     }
     #[inline]
     fn get(&self, k: &MemoKey) -> Option<u32> {
+        self.probe(k).0
+    }
+    #[inline]
+    fn probe(&self, k: &MemoKey) -> (Option<u32>, Option<MemoVacancy>) {
         if self.size == 0 {
-            return None;
+            return (None, None);
         }
-        let k = Self::pack(k)?;
+        let Some(k) = Self::pack(k) else {
+            return (None, None);
+        };
         let mask = self.size - 1;
         let mut i = Self::home(&k, self.size);
         loop {
             let s = self.slots[i];
             if s.val == NONE {
-                return None;
+                return (
+                    None,
+                    Some(MemoVacancy {
+                        size: self.size,
+                        index: i,
+                        key: k,
+                    }),
+                );
             }
             if s.key == k {
-                return Some(s.val);
+                return (Some(s.val), None);
             }
             i = (i + 1) & mask;
+        }
+    }
+    /// Reuse the vacant slot from this key's probe in the current attempt.
+    /// Entries are never removed or moved without a resize during an attempt.
+    /// A filled vacancy or a resize therefore needs the ordinary insertion.
+    fn insert_probed(
+        &mut self,
+        k: MemoKey,
+        v: u32,
+        vacancy: Option<MemoVacancy>,
+        b: &mut Budget,
+        reserved: &mut u64,
+    ) -> R<()> {
+        if let Some(vacancy) = vacancy
+            && vacancy.size == self.size
+            && self.used < Self::grow_at(self.size)
+            && self.slots[vacancy.index].val == NONE
+        {
+            debug_assert_eq!(Some(vacancy.key), Self::pack(&k));
+            if v == NONE {
+                return Err(KErr::Resource(ResourceError::Invariant));
+            }
+            self.slots[vacancy.index] = MemoSlot {
+                key: vacancy.key,
+                val: v,
+            };
+            self.used += 1;
+            Ok(())
+        } else {
+            self.insert(k, v, b, reserved)
         }
     }
     fn insert(&mut self, k: MemoKey, v: u32, b: &mut Budget, reserved: &mut u64) -> R<()> {
@@ -859,7 +908,16 @@ struct Meta {
     delta: u32,
     whnf: u32,
     core: u32,
-    ty: u32,
+}
+
+// Same completed intrinsic-type facts and exact value IDs as Meta.ty.
+// Scope: this owned graph/source/typed-context instance. Both vectors move
+// with retention and clear before capacity-only Arena reuse. No eviction.
+#[derive(Default)]
+struct TypePages {
+    // Zero: absent page. Otherwise one plus a 256-aligned offset in values.
+    directory: Vec<u32>,
+    values: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -994,6 +1052,7 @@ enum NatLit {
     Small(u64),
     /// Canonical decimal digits of a value above `u64::MAX`.
     Big(Vec<u8>),
+    Computed(Box<[crate::check::natural::BinaryNat; 1]>),
 }
 
 /// Capacity reused across declaration attempts on one thread. Contents are
@@ -1004,6 +1063,7 @@ enum NatLit {
 struct Arena {
     vals: Vec<Val>,
     meta: Vec<Meta>,
+    type_cache: TypePages,
     cells: Vec<Cell>,
     envs: Vec<EnvNode>,
     locals: Vec<u32>,
@@ -1054,6 +1114,7 @@ pub(crate) struct Kernel<'e, 'w> {
 
     vals: Vec<Val>,
     meta: Vec<Meta>,
+    type_cache: TypePages,
     cells: Vec<Cell>,
     envs: Vec<EnvNode>,
     locals: Vec<u32>,
@@ -1135,6 +1196,8 @@ pub(crate) struct Kernel<'e, 'w> {
     /// Cached min(bounds.total, bounds.arguments + span_work), saturated.
     /// steps_by uses only this total-step bound; no second clock in its hot path.
     limit: u64,
+    natural_probe_depth: u8,
+    neutral_head_only: bool,
     bounds: ProbeBounds,
     span_work: u64,
     source_support: Map<u32, u64>,
@@ -1177,6 +1240,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let mut a = ARENA.with(|c| c.borrow_mut().take()).unwrap_or_default();
         a.vals.clear();
         a.meta.clear();
+        a.type_cache.directory.clear();
+        a.type_cache.values.clear();
         a.cells.clear();
         a.envs.clear();
         a.locals.clear();
@@ -1212,6 +1277,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             subst_end,
             vals: a.vals,
             meta: a.meta,
+            type_cache: a.type_cache,
             cells: a.cells,
             envs: a.envs,
             locals: a.locals,
@@ -1261,6 +1327,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
             charged: 0,
             reserved: 0,
             limit: u64::MAX,
+            natural_probe_depth: 0,
+            neutral_head_only: false,
             bounds: ProbeBounds {
                 total: u64::MAX,
                 arguments: u64::MAX,
@@ -1460,6 +1528,10 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let a = Arena {
             vals: vec(&mut self.vals),
             meta: vec(&mut self.meta),
+            type_cache: TypePages {
+                directory: vec(&mut self.type_cache.directory),
+                values: vec(&mut self.type_cache.values),
+            },
             cells: vec(&mut self.cells),
             envs: vec(&mut self.envs),
             locals: vec(&mut self.locals),
@@ -1499,7 +1571,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             Val::Str(e) => (10, e.slot(), 0, 0, 0),
             Val::Nat(n) => match self.nats[n as usize] {
                 NatLit::Small(x) => (9, x as u32, (x >> 32) as u32, 0, 0),
-                NatLit::Big(_) => return None,
+                NatLit::Big(_) | NatLit::Computed(_) => return None,
             },
             _ => return None,
         })
@@ -1553,7 +1625,6 @@ impl<'e, 'w> Kernel<'e, 'w> {
             delta: NONE,
             whnf: NONE,
             core: NONE,
-            ty: NONE,
         });
         Ok(id)
     }
@@ -1670,6 +1741,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         env: u32,
         loose: u32,
         has_free: bool,
+        fallback: (u32, u32, u32),
     ) -> R<(u32, u32, u32)> {
         if loose > 2
             && loose <= 63
@@ -1702,7 +1774,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         {
             return self.wide_evaluation_read_key(e, env);
         }
-        Ok(self.ekey(env, loose))
+        Ok(fallback)
     }
     // Called only after the original narrow-key path is unavailable and the
     // exact existing scope/read-mask guards hold. Keep this larger setup out
@@ -2645,36 +2717,48 @@ impl<'e, 'w> Kernel<'e, 'w> {
     fn thunk_general(&mut self, e: ExprId, env: u32, li: u32, node: Expression<'w>) -> R<u32> {
         // Variables and cheap forms first: they never need a thunk, and the
         // memo is consulted (once) only for delayed computations.
-        let kind = node.kind(self.exprs, self.levels, self.b)?;
-        match kind {
-            ExprKind::Bound(i) => return Ok(self.env_at(env, i)?.val),
-            ExprKind::Sort(_)
-            | ExprKind::Constant(..)
-            | ExprKind::Lambda(..)
-            | ExprKind::Pi(..)
-            | ExprKind::Natural(_)
-            | ExprKind::String(_) => return self.eval_decoded(e, env, li, node, kind),
-            _ => {}
+        if node.is_application() {
+            // Delaying an application does not use its operands. Keep the
+            // lookup observation made by kind() and decode them on demand.
+            self.b.observe(crate::resource::Event::TableLookups, 1);
+        } else {
+            let kind = node.kind(self.exprs, self.levels, self.b)?;
+            match kind {
+                ExprKind::Bound(i) => return Ok(self.env_at(env, i)?.val),
+                ExprKind::Sort(_)
+                | ExprKind::Constant(..)
+                | ExprKind::Lambda(..)
+                | ExprKind::Pi(..)
+                | ExprKind::Natural(_)
+                | ExprKind::String(_) => return self.eval_decoded(e, env, li, node, kind),
+                _ => {}
+            }
         }
         let loose = node.loose_range();
         let (kt, k1, k2) = self.ekey(env, loose);
         let exact = (e.slot(), li, kt, k1, k2);
-        if let Some(v) = self.memo.get(&exact) {
+        let (cached, mut vacancy) = self.memo.probe(&exact);
+        if let Some(v) = cached {
             return Ok(v);
         }
-        let (kt, k1, k2) = self.evaluation_read_key(e, env, loose, node.has_free())?;
+        let (kt, k1, k2) =
+            self.evaluation_read_key(e, env, loose, node.has_free(), (kt, k1, k2))?;
         let mkey = (e.slot(), li, kt, k1, k2);
         // The selected exact key owns the shared recipe. Do not duplicate it
         // under a raw-environment alias. Eligibility changes can
         // lose sharing, but a second valid recipe supplies no completion fact.
-        if mkey != exact
-            && let Some(v) = self.memo.get(&mkey)
-        {
-            return Ok(v);
+        if mkey != exact {
+            let (cached, slot) = self.memo.probe(&mkey);
+            if let Some(v) = cached {
+                return Ok(v);
+            }
+            vacancy = slot;
         }
         let env = if loose == 0 { 0 } else { env };
-        let v = self.push(Val::Delayed { e, env, li })?;
-        self.memo.insert(mkey, v, self.b, &mut self.reserved)?;
+        // Delayed values have no structural interner key.
+        let v = self.push_fresh(Val::Delayed { e, env, li }, None)?;
+        self.memo
+            .insert_probed(mkey, v, vacancy, self.b, &mut self.reserved)?;
         Ok(v)
     }
     fn eval(&mut self, e: ExprId, env: u32, li: u32) -> R<u32> {
@@ -2727,7 +2811,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let mut mkey = exact;
         let mut cached = self.memo.get(&exact);
         if cached.is_none() {
-            let (kt, k1, k2) = self.evaluation_read_key(e, env, loose, node.has_free())?;
+            let (kt, k1, k2) =
+                self.evaluation_read_key(e, env, loose, node.has_free(), (kt, k1, k2))?;
             mkey = (e.slot(), li, kt, k1, k2);
             if mkey != exact {
                 cached = self.memo.get(&mkey);
@@ -2787,38 +2872,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 let li = self.intern_li(ci, levels)?;
                 self.push(Val::Const { ci, li, spine: 0 })
             }
-            ExprKind::App(first_f, first_a) => {
-                let mut args = self.scratch.pop().unwrap_or_default();
-                args.clear();
-                let res = (|| {
-                    // Construction contract: kind was decoded from e in the
-                    // same immutable source; f/a are exactly that App's fields.
-                    self.scratch_room(&mut args, 1)?;
-                    args.push(first_a.slot());
-                    let mut head = first_f;
-                    let (node, kind) = loop {
-                        let node = self.exprs.get(head, self.b)?;
-                        let kind = node.kind(self.exprs, self.levels, self.b)?;
-                        match kind {
-                            ExprKind::App(f, a) => {
-                                self.scratch_room(&mut args, 1)?;
-                                args.push(a.slot());
-                                head = f;
-                            }
-                            _ => break (node, kind),
-                        }
-                    };
-                    // The retained view and kind were read from head in this
-                    // loop and never cross a source mutation or retirement.
-                    let f = self.eval_decoded(head, env, li, node, kind)?;
-                    args.reverse();
-                    for slot in args.iter_mut() {
-                        *slot = self.thunk(ExprId::from_stored_original(*slot), env, li)?;
-                    }
-                    self.apply_many(f, &args)
-                })();
-                self.scratch_finish(res, [args])
-            }
+            ExprKind::App(first_f, first_a) => self.small_application(first_f, first_a, env, li),
             ExprKind::Lambda(_, d, body, _) => self.push(Val::Lam(Clo {
                 dom: d,
                 body,
@@ -2849,6 +2903,73 @@ impl<'e, 'w> Kernel<'e, 'w> {
             ExprKind::String(_) => self.push(Val::Str(e)),
             _ => no(),
         }
+    }
+    // Same source argument order, decoded head and original thunk identities.
+    // Stack-only until the ninth argument; spill owns/recycles its charged buffer.
+    fn small_application(&mut self, first_f: ExprId, first_a: ExprId, env: u32, li: u32) -> R<u32> {
+        let mut slots = [0u32; 8];
+        slots[0] = first_a.slot();
+        let mut len = 1;
+        let mut head = first_f;
+        loop {
+            let node = self.exprs.get(head, self.b)?;
+            let kind = node.kind(self.exprs, self.levels, self.b)?;
+            match kind {
+                ExprKind::App(f, a) => {
+                    if len == slots.len() {
+                        return self.spilled_application(&slots, f, a, env, li);
+                    }
+                    slots[len] = a.slot();
+                    len += 1;
+                    head = f;
+                }
+                _ => {
+                    let f = self.eval_decoded(head, env, li, node, kind)?;
+                    let args = &mut slots[..len];
+                    args.reverse();
+                    for slot in args.iter_mut() {
+                        *slot = self.thunk(ExprId::from_stored_original(*slot), env, li)?;
+                    }
+                    return self.apply_many(f, args);
+                }
+            }
+        }
+    }
+    fn spilled_application(
+        &mut self,
+        prefix: &[u32],
+        first_f: ExprId,
+        first_a: ExprId,
+        env: u32,
+        li: u32,
+    ) -> R<u32> {
+        let mut args = self.scratch.pop().unwrap_or_default();
+        args.clear();
+        let res = (|| {
+            self.scratch_room(&mut args, prefix.len() + 1)?;
+            args.values.extend_from_slice(prefix);
+            args.push(first_a.slot());
+            let mut head = first_f;
+            let (node, kind) = loop {
+                let node = self.exprs.get(head, self.b)?;
+                let kind = node.kind(self.exprs, self.levels, self.b)?;
+                match kind {
+                    ExprKind::App(f, a) => {
+                        self.scratch_room(&mut args, 1)?;
+                        args.push(a.slot());
+                        head = f;
+                    }
+                    _ => break (node, kind),
+                }
+            };
+            let f = self.eval_decoded(head, env, li, node, kind)?;
+            args.reverse();
+            for slot in args.iter_mut() {
+                *slot = self.thunk(ExprId::from_stored_original(*slot), env, li)?;
+            }
+            self.apply_many(f, &args)
+        })();
+        self.scratch_finish(res, [args])
     }
     /// Expand a string literal to `String.ofList [Char.ofNat c₁, …]` under the
     /// committed String certificate, as the existing route does.
@@ -3438,6 +3559,9 @@ impl<'e, 'w> Kernel<'e, 'w> {
     // constants already fail both guards below without a query or charge.
     #[inline(always)]
     fn nat_reduce_in(&mut self, v: u32, lazy: bool) -> R<Option<u32>> {
+        if self.neutral_head_only {
+            return Ok(None);
+        }
         let Val::Const { ci, spine, .. } = self.vals[v as usize] else {
             return Ok(None);
         };
@@ -3463,8 +3587,15 @@ impl<'e, 'w> Kernel<'e, 'w> {
             if let Some(x) = self.nat_value_in(arg, lazy)? {
                 let next = match nat_literal(&self.nats, x) {
                     NatLit::Small(n) if *n < u64::MAX => NatLit::Small(n + 1),
+                    x @ NatLit::Computed(_) => computed_nat(
+                        crate::check::natural::Operation::Add,
+                        x,
+                        &NatLit::Small(1),
+                        self.b,
+                        &mut self.reserved,
+                    )?,
                     other => {
-                        let d = nat_digits(other);
+                        let d = nat_digits(other)?;
                         match crate::check::natural::successor(d.as_bytes(), self.b) {
                             Ok(d) => {
                                 let lit = parse_nat(d.as_bytes(), self.b, &mut self.reserved);
@@ -3510,13 +3641,11 @@ impl<'e, 'w> Kernel<'e, 'w> {
         // Literal entries are immutable and cannot retire within this attempt.
         let Some(op) = op else {
             let equality = pred == Some(true);
-            let (xs, ys) = (
-                nat_digits(nat_literal(&self.nats, x)),
-                nat_digits(nat_literal(&self.nats, y)),
-            );
-            let (xs, ys) = (xs.as_bytes(), ys.as_bytes());
-            self.b.charge_work((xs.len() + ys.len() + 4) as u64)?;
-            let order = xs.len().cmp(&ys.len()).then_with(|| xs.cmp(ys));
+            let order = compare_naturals(
+                nat_literal(&self.nats, x),
+                nat_literal(&self.nats, y),
+                self.b,
+            )?;
             let answer = if equality {
                 order.is_eq()
             } else {
@@ -3539,8 +3668,11 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let (x, y) = (nat_literal(&self.nats, x), nat_literal(&self.nats, y));
         let r = match nat_small(op, x, y) {
             Some(r) => NatLit::Small(r),
+            None if use_binary_operation(op, x, y) => {
+                computed_nat(op, x, y, self.b, &mut self.reserved)?
+            }
             None => {
-                let (xs, ys) = (nat_digits(x), nat_digits(y));
+                let (xs, ys) = (nat_digits(x)?, nat_digits(y)?);
                 match crate::check::natural::arithmetic(op, xs.as_bytes(), ys.as_bytes(), self.b) {
                     Ok(d) => {
                         let lit = parse_nat(d.as_bytes(), self.b, &mut self.reserved);
@@ -3904,7 +4036,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
                     idx: i,
                     sci: fci,
                 })?;
-                self.meta[field as usize].ty = field_type;
+                self.cache_type(field, field_type)?;
                 cspine = self.cell(cspine, field, 0)?;
                 // Only a later field consumes this instantiated telescope.
                 // Committed constructor validation already checks its result family.
@@ -4676,10 +4808,52 @@ impl<'e, 'w> Kernel<'e, 'w> {
         let t = self.infer(e, env, 0, true)?;
         if self.defeq(t, ty)? { Ok(()) } else { no() }
     }
+    #[inline]
+    fn cached_type(&self, v: u32) -> u32 {
+        let Some(&page) = self.type_cache.directory.get((v >> 8) as usize) else {
+            return NONE;
+        };
+        if page == 0 {
+            return NONE;
+        }
+        // Published offsets own a complete initialized page; no absent page
+        // or out-of-scope value can supply a completed cached type.
+        self.type_cache.values[(page - 1) as usize + (v & 255) as usize]
+    }
+    fn cache_type(&mut self, v: u32, ty: u32) -> R<()> {
+        if v as usize >= self.vals.len() {
+            return Err(ResourceError::Invariant.into());
+        }
+        let index = (v >> 8) as usize;
+        if self.type_cache.directory.len() <= index {
+            let extra = index + 1 - self.type_cache.directory.len();
+            room(
+                self.b,
+                &mut self.reserved,
+                &mut self.type_cache.directory,
+                extra,
+            )?;
+            self.type_cache.directory.resize(index + 1, 0);
+        }
+        if self.type_cache.directory[index] == 0 {
+            let start = self.type_cache.values.len();
+            let end = start.checked_add(256).ok_or(ResourceError::Counter)?;
+            let page = u32::try_from(start.checked_add(1).ok_or(ResourceError::Counter)?)
+                .map_err(|_| ResourceError::Counter)?;
+            room(self.b, &mut self.reserved, &mut self.type_cache.values, 256)?;
+            self.type_cache.values.resize(end, NONE);
+            // Publish only a completely initialized page after every fallible
+            // reservation/allocation; the type fact itself is already complete.
+            self.type_cache.directory[index] = page;
+        }
+        let at = (self.type_cache.directory[index] - 1) as usize + (v & 255) as usize;
+        self.type_cache.values[at] = ty;
+        Ok(())
+    }
     /// The type of a value, when it can be computed without checking.
     fn infer_value(&mut self, v: u32) -> R<Option<u32>> {
         let v = self.force(v)?;
-        let cached = self.meta[v as usize].ty;
+        let cached = self.cached_type(v);
         if cached != NONE {
             return Ok(Some(cached));
         }
@@ -4758,7 +4932,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
             }
             _ => return Ok(None),
         };
-        self.meta[v as usize].ty = t;
+        self.cache_type(v, t)?;
         Ok(Some(t))
     }
     fn spine_type(
@@ -4938,7 +5112,9 @@ impl<'e, 'w> Kernel<'e, 'w> {
     fn quick(&mut self, a: u32, c: u32) -> R<Option<bool>> {
         Ok(Some(match (self.vals[a as usize], self.vals[c as usize]) {
             (Val::Sort(x), Val::Sort(y)) => self.level_eq(x, y)?,
-            (Val::Nat(x), Val::Nat(y)) => nat_eq(&self.nats[x as usize], &self.nats[y as usize]),
+            (Val::Nat(x), Val::Nat(y)) => {
+                nat_eq(&self.nats[x as usize], &self.nats[y as usize], self.b)?
+            }
             (Val::Str(x), Val::Str(y)) => {
                 let bx = match self
                     .exprs
@@ -5395,10 +5571,178 @@ impl<'e, 'w> Kernel<'e, 'w> {
         }
         self.unit_like(a, c)
     }
+    fn expose_natural_successors(&mut self, mut n: u32, projections: bool) -> R<(u32, u32)> {
+        let mut count = 0u32;
+        for _ in 0..64 {
+            self.steps_by(1)?;
+            n = self.whnf_core(n)?;
+            if projections && let Some(next) = self.expose_stuck_projection(n)? {
+                n = next;
+                continue;
+            }
+            let Val::Const { ci, spine, .. } = self.vals[n as usize] else {
+                break;
+            };
+            if spine == 0 {
+                break;
+            }
+            if self.cells[spine as usize].len == 1
+                && let Some(argument) = self.arg_item(spine)
+                && self.nat_ctors()?.is_some_and(|(_, _, succ)| succ == ci)
+            {
+                count += 1;
+                n = argument;
+            } else if self.const_view(ci)?.delta.is_some() {
+                n = self.unfold_value(n)?;
+            } else {
+                break;
+            }
+        }
+        Ok((n, count))
+    }
+    fn compare_before_natural_reduction(&mut self, a: u32, c: u32) -> R<bool> {
+        let (
+            Val::Const {
+                ci: ca, spine: sa, ..
+            },
+            Val::Const {
+                ci: cc, spine: sc, ..
+            },
+        ) = (self.vals[a as usize], self.vals[c as usize])
+        else {
+            return Ok(false);
+        };
+        let ordinary_pair = |spine: u32| {
+            let last = self.cells[spine as usize];
+            last.len == 2 && last.tag == 0 && self.cells[last.prev as usize].tag == 0
+        };
+        let left_pair = ordinary_pair(sa);
+        let right_pair = ordinary_pair(sc);
+        let selected = |op| matches!(op, Some(Operation::Add | Operation::Div | Operation::Mod));
+        let left_op =
+            left_pair && self.const_view(ca)?.params.is_empty() && selected(self.natop(ca)?);
+        let right_op =
+            right_pair && self.const_view(cc)?.params.is_empty() && selected(self.natop(cc)?);
+        if !left_op && !right_op {
+            return Ok(false);
+        }
+        // The ordinary let-fold policy already bounds evaluation through a let.
+        // Leave either marked argument to that route.
+        let spine = if left_op { sa } else { sc };
+        let last = self.cells[spine as usize];
+        if !self.let_marks.is_empty()
+            && [last.item, self.cells[last.prev as usize].item]
+                .into_iter()
+                .any(|mut value| {
+                    for _ in 0..4 {
+                        if self.let_bit(2 * u64::from(value)) {
+                            return true;
+                        }
+                        match self.vals[value as usize] {
+                            Val::Ind(next) => value = next,
+                            _ => return false,
+                        }
+                    }
+                    true
+                })
+        {
+            return Ok(false);
+        }
+        let nesting = self.natural_probe_depth;
+        if nesting >= 3 || (nesting == 0 && self.bounds.arguments != u64::MAX) {
+            return Ok(false);
+        }
+        self.natural_probe_depth = nesting + 1;
+        let saved = self.bounds;
+        let depth = self.binders.len();
+        self.limit_arguments(self.argument_steps().saturating_add(ARGS_BUDGET));
+        let outcome = (|| -> R<bool> {
+            let (target, mut other) = if left_op { (a, c) } else { (c, a) };
+            for _ in 0..12 {
+                self.steps_by(1)?;
+                if other == target {
+                    return Ok(true);
+                }
+                if let Some(exposed) = self.expose_stuck_projection(other)? {
+                    other = exposed;
+                    continue;
+                }
+                let Val::Const {
+                    ci: x,
+                    li: lx,
+                    spine: sx,
+                } = self.vals[other as usize]
+                else {
+                    break;
+                };
+                let Val::Const {
+                    ci: y,
+                    li: ly,
+                    spine: sy,
+                } = self.vals[target as usize]
+                else {
+                    break;
+                };
+                if x == y {
+                    if self.cells[sx as usize].len != self.cells[sy as usize].len
+                        || !self.same_levels(lx, ly)?
+                    {
+                        break;
+                    }
+                    if [sx, sy].iter().any(|&spine| {
+                        let last = self.cells[spine as usize];
+                        last.tag != 0 || self.cells[last.prev as usize].tag != 0
+                    }) {
+                        break;
+                    }
+                    self.steps_by(u64::from(self.cells[sx as usize].len))?;
+                    let (left, right, ls, rs) = if left_op {
+                        (target, other, sy, sx)
+                    } else {
+                        (other, target, sx, sy)
+                    };
+                    let left_base =
+                        self.whnf_core(self.cells[self.cells[ls as usize].prev as usize].item)?;
+                    let right_base =
+                        self.whnf_core(self.cells[self.cells[rs as usize].prev as usize].item)?;
+                    if left_base != right_base
+                        && self.quick(left_base, right_base)? != Some(true)
+                        && self.natop(x)? == Some(Operation::Add)
+                    {
+                        let (u, m) = self.expose_natural_successors(left, false)?;
+                        let (v, n) = self.expose_natural_successors(right, false)?;
+                        if m != 0 && m == n && (u == v || self.defeq(u, v)?) {
+                            return Ok(true);
+                        }
+                    }
+                    return Ok(self.spines(left, right, 0)? == Some(true));
+                }
+                if self.const_view(x)?.delta.is_none() {
+                    break;
+                }
+                self.steps_by(u64::from(self.cells[sx as usize].len) + 1)?;
+                other = self.unfold_value(other)?;
+            }
+            Ok(false)
+        })();
+        self.natural_probe_depth = nesting;
+        self.restore_bounds(saved);
+        self.binders.truncate(depth);
+        match outcome {
+            Err(e @ (KErr::Resource(_) | KErr::LiteralArithmetic | KErr::StepLimit)) => Err(e),
+            Err(KErr::Abort) if self.steps > self.limit => Err(KErr::Abort),
+            _ if self.steps > step_cap() => step_limit(),
+            Err(KErr::Unsupported | KErr::Abort) => Ok(false),
+            r => r,
+        }
+    }
     /// Lazy delta: unfold the side with the higher definitional priority one
     /// step at a time, trying cheap decisions after each step.
     fn lazy_delta(&mut self, mut a: u32, mut c: u32, arguments: bool) -> R<Lazy> {
         loop {
+            if self.compare_before_natural_reduction(a, c)? {
+                return Ok(Lazy::Decided(true));
+            }
             let mut reduced = false;
             if let Some(n) = self.nat_reduce_in(a, true)? {
                 a = self.whnf_core(n)?;
@@ -6080,7 +6424,9 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 (self.const_view(a)?.ctor, self.const_view(b)?.ctor),
                 (Some((fa, ia)), Some((fb, ib))) if fa == fb && ia != ib
             ),
-            (Val::Nat(a), Val::Nat(b)) => !nat_eq(&self.nats[a as usize], &self.nats[b as usize]),
+            (Val::Nat(a), Val::Nat(b)) => {
+                !nat_eq(&self.nats[a as usize], &self.nats[b as usize], self.b)?
+            }
             _ => false,
         })
     }
@@ -6460,8 +6806,8 @@ impl NatDigits<'_> {
         }
     }
 }
-fn nat_digits(n: &NatLit) -> NatDigits<'_> {
-    match n {
+fn nat_digits(n: &NatLit) -> R<NatDigits<'_>> {
+    Ok(match n {
         NatLit::Small(v) => {
             let mut bytes = [0u8; 20];
             let mut start = bytes.len();
@@ -6477,19 +6823,112 @@ fn nat_digits(n: &NatLit) -> NatDigits<'_> {
             NatDigits::Small { bytes, start }
         }
         NatLit::Big(bytes) => NatDigits::Big(bytes),
+        NatLit::Computed(_) => return Err(ResourceError::Invariant.into()),
+    })
+}
+
+use crate::check::natural::{BinaryNat, Operation};
+
+fn use_binary_operation(op: Operation, left: &NatLit, right: &NatLit) -> bool {
+    let wide = |n: &NatLit| {
+        matches!(n, NatLit::Computed(_)) || matches!(n, NatLit::Big(digits) if digits.len() > 600)
+    };
+    wide(left)
+        || wide(right)
+        || matches!((op, right), (Operation::Pow | Operation::ShiftLeft, NatLit::Small(n)) if *n > 2016)
+}
+
+fn binary_error(error: crate::check::natural::Error) -> KErr {
+    match error {
+        crate::check::natural::Error::Resource(e) => KErr::Resource(e),
+        crate::check::natural::Error::Unsupported => KErr::LiteralArithmetic,
     }
 }
 
-fn nat_eq(a: &NatLit, c: &NatLit) -> bool {
-    match (a, c) {
+fn binary_operand<'a>(
+    n: &'a NatLit,
+    budget: &mut Budget,
+    scratch: &mut u64,
+) -> R<std::borrow::Cow<'a, BinaryNat>> {
+    use std::borrow::Cow;
+    Ok(match n {
+        NatLit::Small(x) => Cow::Owned(BinaryNat::small(*x)),
+        NatLit::Computed(x) => Cow::Borrowed(&x[0]),
+        NatLit::Big(bytes) => Cow::Owned(
+            crate::check::natural::parse_binary(bytes, budget, scratch).map_err(binary_error)?,
+        ),
+    })
+}
+
+fn with_binary_operands<T>(
+    a: &NatLit,
+    b: &NatLit,
+    budget: &mut Budget,
+    f: impl FnOnce(&BinaryNat, &BinaryNat, &mut Budget) -> R<T>,
+) -> R<T> {
+    let mut scratch = 0;
+    let result = (|| {
+        let a = binary_operand(a, budget, &mut scratch)?;
+        let b = binary_operand(b, budget, &mut scratch)?;
+        f(&a, &b, budget)
+    })();
+    budget.release(scratch)?;
+    result
+}
+
+fn computed_nat(
+    op: Operation,
+    a: &NatLit,
+    b: &NatLit,
+    budget: &mut Budget,
+    retained: &mut u64,
+) -> R<NatLit> {
+    let value = with_binary_operands(a, b, budget, |a, b, budget| {
+        crate::check::natural::binary_arithmetic(op, a, b, budget, retained).map_err(binary_error)
+    })?;
+    Ok(match value.as_small() {
+        Some(n) => NatLit::Small(n),
+        None => {
+            const { assert!(std::mem::size_of::<BinaryNat>() <= 40) };
+            charge_bytes(budget, retained, 40)?;
+            let mut slot = Vec::new();
+            slot.try_reserve_exact(1).map_err(|_| alloc_failed())?;
+            slot.push(value);
+            NatLit::Computed(
+                slot.into_boxed_slice()
+                    .try_into()
+                    .map_err(|_| ResourceError::Invariant)?,
+            )
+        }
+    })
+}
+
+fn compare_naturals(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<std::cmp::Ordering> {
+    if matches!(a, NatLit::Computed(_)) || matches!(b, NatLit::Computed(_)) {
+        return with_binary_operands(a, b, budget, |a, b, budget| Ok(a.compare(b, budget)?));
+    }
+    let (x, y) = (nat_digits(a)?, nat_digits(b)?);
+    let (x, y) = (x.as_bytes(), y.as_bytes());
+    budget.charge_work((x.len() + y.len() + 4) as u64)?;
+    Ok(x.len().cmp(&y.len()).then_with(|| x.cmp(y)))
+}
+
+fn nat_eq(a: &NatLit, b: &NatLit, budget: &mut Budget) -> R<bool> {
+    Ok(match (a, b) {
         (NatLit::Small(x), NatLit::Small(y)) => x == y,
         (NatLit::Big(x), NatLit::Big(y)) => x == y,
+        (NatLit::Computed(_), _) | (_, NatLit::Computed(_)) => {
+            compare_naturals(a, b, budget)?.is_eq()
+        }
         _ => false,
-    }
+    })
 }
 fn nat_pred(n: &NatLit, budget: &mut Budget, reserved: &mut u64) -> R<NatLit> {
     match n {
         NatLit::Small(v) => Ok(NatLit::Small(v - 1)),
+        x @ NatLit::Computed(_) => {
+            computed_nat(Operation::Sub, x, &NatLit::Small(1), budget, reserved)
+        }
         // This is the sole canonical big input whose predecessor is small.
         NatLit::Big(bytes) if bytes == b"18446744073709551616" => Ok(NatLit::Small(u64::MAX)),
         NatLit::Big(bytes) => {
@@ -6924,7 +7363,7 @@ crate::resource::charged::charged! {
     ((u32, u32, u32), u32) => 16,
     EnvNode => 12,
     Cell => 16,
-    Meta => 16,
+    Meta => 12,
     Val => 20,
     Option<(NonZeroU32, (u32, u32, u32, u32, u32, u32), u32)> => 32,
     Option<(NonZeroU32, (u32, u32, u32, u32, u32, u32), ())> => 28,

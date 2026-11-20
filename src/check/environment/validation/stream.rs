@@ -101,7 +101,7 @@ impl Rejection {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     std::mem::size_of::<Complete>()
-        == 896 + std::mem::size_of::<super::theorem_judgments::Judgments>()
+        == 1008 + std::mem::size_of::<super::theorem_judgments::Judgments>()
 );
 impl Complete {
     pub(crate) fn rejection(&self) -> Option<Rejection> {

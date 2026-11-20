@@ -402,6 +402,14 @@ impl Budget {
         )
     }
 
+    /// Test whether a complete arithmetic plan fits before selecting its algorithm.
+    pub(crate) fn has_work_headroom(&self, work: u64) -> bool {
+        self.snapshot
+            .work_charged
+            .checked_add(work)
+            .is_some_and(|end| end <= self.work_limit)
+    }
+
     /// Deterministic optional-cache admission check; this does not reserve any
     /// storage. The owner must reserve immediately before attempting allocation.
     pub(crate) fn has_storage_headroom(&self, bytes: u64) -> bool {

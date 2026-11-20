@@ -31,7 +31,7 @@ pub(crate) struct State {
 }
 // Declaration entries remain unchanged.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<State>() == 856 + size_of::<theorem_judgments::Judgments>());
+const _: () = assert!(size_of::<State>() == 968 + size_of::<theorem_judgments::Judgments>());
 fn unsupported() -> FailureReport {
     FailureReport {
         outcome: FailureOutcome::Decline,

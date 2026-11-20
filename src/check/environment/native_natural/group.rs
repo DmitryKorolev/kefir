@@ -291,7 +291,7 @@ impl Environment {
                 }
                 internal[referent / 32] |= bit;
             }
-            for pin in 0..2 {
+            for pin in 0..super::PIN_COUNT {
                 let mut complete = true;
                 for (member, expected) in members(request).zip(expected_names.clone()) {
                     let referent = expected_referent(expected)?;

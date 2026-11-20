@@ -9,6 +9,7 @@ struct Owned {
     const_by_canon: Map<u32, u32>,
     vals: Vec<Val>,
     meta: Vec<Meta>,
+    type_cache: TypePages,
     cells: Vec<Cell>,
     envs: Vec<EnvNode>,
     locals: Vec<u32>,
@@ -60,6 +61,7 @@ impl Owned {
             const_by_canon: std::mem::take(&mut k.const_by_canon),
             vals: std::mem::take(&mut k.vals),
             meta: std::mem::take(&mut k.meta),
+            type_cache: std::mem::take(&mut k.type_cache),
             cells: std::mem::take(&mut k.cells),
             envs: std::mem::take(&mut k.envs),
             locals: std::mem::take(&mut k.locals),
@@ -111,6 +113,7 @@ impl Owned {
         k.const_by_canon = self.const_by_canon;
         k.vals = self.vals;
         k.meta = self.meta;
+        k.type_cache = self.type_cache;
         k.cells = self.cells;
         k.envs = self.envs;
         k.locals = self.locals;
@@ -428,5 +431,5 @@ impl Retention {
 
 // Charged sizes (64-bit layout) of this module's stored types.
 crate::resource::charged::charged! {
-    Snapshot => 1824,
+    Snapshot => 1872,
 }

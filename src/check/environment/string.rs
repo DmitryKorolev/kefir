@@ -18,7 +18,7 @@ mod modulus_mask;
 /// Each completed frontier covers its own full witness and committed visibility.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Certificate {
-    masks: [[u32; manifest::MASK_WORDS]; 2],
+    masks: [[u32; manifest::MASK_WORDS]; PIN_COUNT],
     slots: [u32; 7],
     frontier: u32,
     interface_mask: u32,
@@ -29,10 +29,12 @@ pub(super) struct Certificate {
     modulus_frontier: u32,
 }
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Certificate>() == 152);
+const _: () = assert!(size_of::<Certificate>() == 212);
 // Zero-based referent indices in the generated inventory, in retained-slot order:
 // String, String.ofList, List, List.nil, List.cons, Char, Char.ofNat.
 const ROOTS: [usize; 7] = [34, 288, 23, 274, 100, 6, 290];
+const PIN_COUNT: usize = 3;
+
 impl Certificate {
     /// Exact whole original declaration facts only. Scope is this Environment's
     /// immutable originals, including a same-publication pending copy. This is
@@ -42,7 +44,7 @@ impl Certificate {
             return Ok(false);
         }
         let index = (referent - 1) as usize;
-        if pin >= 2 || index >= manifest::REFERENTS {
+        if pin >= PIN_COUNT || index >= manifest::REFERENTS {
             return Err(ResourceError::Invariant);
         }
         Ok(self.masks[pin][index / 32] & (1 << (index % 32)) != 0)
@@ -51,7 +53,7 @@ impl Certificate {
         &self,
         pin: usize,
         mask: u32,
-        internal: &[u32; 12],
+        internal: &[u32; manifest::MASK_WORDS],
     ) -> Result<bool, ResourceError> {
         let expected = manifest::DEPENDENCY_MASKS
             .get(mask.checked_sub(1).ok_or(ResourceError::Invariant)? as usize)
@@ -63,7 +65,7 @@ impl Certificate {
             .all(|((&required, present), &own)| required & !(present | own) == 0))
     }
     fn insert(&mut self, pin: usize, referent: usize, slot: u32) -> Result<(), ResourceError> {
-        if pin >= 2 || referent >= manifest::REFERENTS || slot == 0 {
+        if pin >= PIN_COUNT || referent >= manifest::REFERENTS || slot == 0 {
             return Err(ResourceError::Invariant);
         }
         self.masks[pin][referent / 32] |= 1 << (referent % 32);
@@ -131,7 +133,8 @@ impl Certificate {
         if self
             .masks
             .iter()
-            .zip(manifest::PIN_CLOSURE_MASKS)
+            // Only the two String/Char pins certify the String interpretation.
+            .zip(manifest::PIN_CLOSURE_MASKS[..2].iter().copied())
             .any(|(present, required)| {
                 present
                     .iter()
@@ -250,19 +253,24 @@ fn candidate(actual: NameId, n: &Names, b: &mut Budget) -> Result<Option<usize>,
     let (mut low, mut high) = (0, manifest::REFERENT_NAMES.len());
     while low < high {
         let middle = low + (high - low) / 2;
-        if last(manifest::REFERENT_NAMES[middle], component)? == Ordering::Less {
+        if last(
+            manifest::REFERENT_NAMES[manifest::LOOKUP_ORDER[middle] as usize],
+            component,
+        )? == Ordering::Less
+        {
             low = middle + 1;
         } else {
             high = middle;
         }
     }
-    while let Some(&expected) = manifest::REFERENT_NAMES.get(low) {
+    while let Some(&referent) = manifest::LOOKUP_ORDER.get(low) {
+        let expected = manifest::REFERENT_NAMES[referent as usize];
         b.charge_work(length as u64 + 1)?;
         if last(expected, component)? != Ordering::Equal {
             break;
         }
         if matching::name(expected, actual, n, b)? {
-            return Ok(Some(low));
+            return Ok(Some(referent as usize));
         }
         low += 1;
     }
@@ -271,9 +279,9 @@ fn candidate(actual: NameId, n: &Names, b: &mut Budget) -> Result<Option<usize>,
 // Each immutable whole-declaration row belongs to exactly one referent. Preserve
 // manifest row order so per-pin matching sees precisely the original alternatives.
 // Bounds and total coverage are checked during compilation; zero is only padding.
-const fn alternative_index() -> [[u16; 2]; manifest::REFERENTS] {
+const fn alternative_index() -> [[u16; PIN_COUNT]; manifest::REFERENTS] {
     assert!(manifest::DECLARATIONS.len() < u16::MAX as usize);
-    let mut result = [[0; 2]; manifest::REFERENTS];
+    let mut result = [[0; PIN_COUNT]; manifest::REFERENTS];
     let mut row = 0;
     while row < manifest::DECLARATIONS.len() {
         let name = manifest::DECLARATIONS[row][0];
@@ -282,7 +290,11 @@ const fn alternative_index() -> [[u16; 2]; manifest::REFERENTS] {
             referent += 1;
         }
         assert!(referent < manifest::REFERENTS);
-        let slot = if result[referent][0] == 0 { 0 } else { 1 };
+        let mut slot = 0;
+        while slot < PIN_COUNT && result[referent][slot] != 0 {
+            slot += 1;
+        }
+        assert!(slot < PIN_COUNT);
         assert!(result[referent][slot] == 0);
         result[referent][slot] = (row + 1) as u16;
         row += 1;
@@ -294,7 +306,7 @@ const fn alternative_index() -> [[u16; 2]; manifest::REFERENTS] {
     }
     result
 }
-static REFERENT_ALTERNATIVES: [[u16; 2]; manifest::REFERENTS] = alternative_index();
+static REFERENT_ALTERNATIVES: [[u16; PIN_COUNT]; manifest::REFERENTS] = alternative_index();
 
 fn names(
     expected: u32,
@@ -362,8 +374,10 @@ impl Environment {
             }
             let pins = manifest::ALTERNATIVE_PIN_MASKS[index];
             let mut eligible = 0;
-            for pin in 0..2 {
-                if pins & (1 << pin) != 0 && previous.dependencies(pin, row[10], &[0; 12])? {
+            for pin in 0..PIN_COUNT {
+                if pins & (1 << pin) != 0
+                    && previous.dependencies(pin, row[10], &[0; manifest::MASK_WORDS])?
+                {
                     eligible |= 1 << pin;
                 }
             }
@@ -385,7 +399,7 @@ impl Environment {
                 .committed
                 .checked_add(1)
                 .ok_or(ResourceError::Counter)?;
-            for pin in 0..2 {
+            for pin in 0..PIN_COUNT {
                 if eligible & (1 << pin) != 0 {
                     next.insert(pin, referent, slot)?;
                 }

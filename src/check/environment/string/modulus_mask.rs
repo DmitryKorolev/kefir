@@ -1,13 +1,3 @@
-//! Pinned Nat.mod closure masks; no authority without whole-row matching.
-//! Generated
+//! Complete, independently matched reference closures.
 pub(super) const ROOT: usize = 262;
-pub(super) const CLOSURES: [[u32; 12]; 2] = [
-    [
-        3026759059, 961798297, 3991923136, 1115919338, 3027276867, 322854883, 2047574972,
-        943808552, 234406102, 1754907152, 3167580613, 102502396,
-    ],
-    [
-        3026759059, 153, 3991923136, 1115919338, 3027276867, 322854883, 2047574972, 943789576,
-        234406102, 1754907152, 3167580613, 102502396,
-    ],
-];
+pub(super) use super::manifest::MOD_CLOSURE_MASKS as CLOSURES;

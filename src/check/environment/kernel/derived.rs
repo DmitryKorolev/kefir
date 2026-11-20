@@ -90,6 +90,7 @@ enum Leaf {
     /// Index into the template store, little-endian in three bytes so a
     /// leaf stays byte-aligned and a whole rule fits in 32 bytes.
     Template([u8; 3]),
+    Projection([u8; 3]),
 }
 /// A recorded residual: `len` nodes from `nodes` in the node store, spine
 /// items counted from `items` in the item store; `root` is the result.
@@ -367,6 +368,27 @@ impl Kernel<'_, '_> {
                 Leaf::Value(Slot::Field(g, k)) => {
                     let v = self.field(rule.guards[g as usize], heads[g as usize].1, k)?;
                     let v = self.materialize(v)?;
+                    return Ok(Some(self.apply_extra(v, &extra[..ne])?));
+                }
+                Leaf::Projection([a, b, c]) => {
+                    let at = u32::from_le_bytes([a, b, c, 0]);
+                    let tp = self.derived.templates[at as usize];
+                    let start = tp.nodes as usize;
+                    let [
+                        TNode::Slot(Slot::Arg(j)),
+                        TNode::Proj {
+                            x: TRef::Node(0),
+                            idx,
+                            sci,
+                        },
+                    ] = self.derived.tnodes[start..start + 2]
+                    else {
+                        return Err(ResourceError::Invariant.into());
+                    };
+                    self.step()?;
+                    let x = self.materialize(args[j as usize])?;
+                    self.step()?;
+                    let v = self.push(Val::Proj { x, idx, sci })?;
                     return Ok(Some(self.apply_extra(v, &extra[..ne])?));
                 }
                 Leaf::Template([a, b, c]) => {
@@ -894,7 +916,25 @@ impl Kernel<'_, '_> {
             self.derived.templates.push(t);
             let [a, b, c, _] = at.to_le_bytes();
             spare(rules, 1)?;
-            rules.push(rule(Leaf::Template([a, b, c])));
+            let start = t.nodes as usize;
+            let direct_projection = t.len == 2
+                && t.root == TRef::Node(1)
+                && matches!(
+                    self.derived.tnodes[start..start + 2],
+                    [
+                        TNode::Slot(Slot::Arg(_)),
+                        TNode::Proj {
+                            x: TRef::Node(0),
+                            ..
+                        }
+                    ]
+                );
+            let packed = [a, b, c];
+            rules.push(rule(if direct_projection {
+                Leaf::Projection(packed)
+            } else {
+                Leaf::Template(packed)
+            }));
         }
         Ok(())
     }
@@ -1087,6 +1127,19 @@ impl Kernel<'_, '_> {
                     };
                     if spine == 0 {
                         break 'out Some(head);
+                    }
+                    let cell = self.cells[spine as usize];
+                    // A single projection of the pattern local denotes the
+                    // projection of its runtime replacement.
+                    if cell.prev == 0 && cell.tag != 0 {
+                        break 'out Self::read_node(
+                            rb,
+                            TNode::Proj {
+                                x: head,
+                                idx: cell.tag - 1,
+                                sci: cell.item,
+                            },
+                        )?;
                     }
                     if self.cells[spine as usize].len as usize > MAX_ARITY {
                         break 'out None;
@@ -1557,11 +1610,7 @@ impl Kernel<'_, '_> {
                     }
                 }
                 (Val::Nat(p), Val::Nat(q)) => {
-                    let equal = match (&self.nats[p as usize], &self.nats[q as usize]) {
-                        (NatLit::Small(u), NatLit::Small(v)) => u == v,
-                        (NatLit::Big(u), NatLit::Big(v)) => u == v,
-                        _ => false,
-                    };
+                    let equal = nat_eq(&self.nats[p as usize], &self.nats[q as usize], self.b)?;
                     if !equal {
                         return Ok(false);
                     }

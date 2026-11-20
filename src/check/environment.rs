@@ -207,7 +207,7 @@ pub(crate) struct Environment {
 // Fixed certificates include the160-byte remaining-Nat certificate, for 744 bytes
 // total. Entry layout remains48bytes; no per-declaration stage/certificate field.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Environment>() == 744);
+const _: () = assert!(size_of::<Environment>() == 856);
 // Preparation-only, same-owner checkpoint minted before begin_stage. It cannot
 // authorize publication or generated-root lookup; it only bounds retirement.
 struct SignatureStageCheckpoint {

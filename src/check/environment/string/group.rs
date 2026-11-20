@@ -280,7 +280,7 @@ impl Environment {
                 .chain(matching::sequence(constructors)?)
                 .chain(matching::sequence(recursors)?)
                 .copied();
-            let mut internal = [0u32; 12];
+            let mut internal = [0u32; manifest::MASK_WORDS];
             for expected in expected_names.clone() {
                 let referent = expected_referent(expected)?;
                 let bit = 1 << (referent % 32);
@@ -289,13 +289,15 @@ impl Environment {
                 }
                 internal[referent / 32] |= bit;
             }
-            for pin in 0..2 {
+            for pin in 0..PIN_COUNT {
                 let mut complete = true;
                 for (member, expected) in members(request).zip(expected_names.clone()) {
                     let referent = expected_referent(expected)?;
                     let expected_name = manifest::REFERENT_NAMES[referent];
                     let mut matched = false;
-                    b.charge_work(manifest::DECLARATIONS.len() as u64 + 12)?;
+                    b.charge_work(
+                        manifest::DECLARATIONS.len() as u64 + manifest::MASK_WORDS as u64,
+                    )?;
                     for alternative in REFERENT_ALTERNATIVES[referent] {
                         if alternative == 0 {
                             continue;

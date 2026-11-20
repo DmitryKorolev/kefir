@@ -279,6 +279,11 @@ impl Expression<'_> {
     pub(crate) fn bound_index(self) -> Option<u32> {
         (self.tag() == 0).then_some(self.stored.fields[0])
     }
+    /// The raw application arm has no side payload to validate.
+    #[inline(always)]
+    pub(crate) fn is_application(self) -> bool {
+        self.tag() == 3
+    }
     pub(crate) fn has_free(self) -> bool {
         self.flags() & FREE != 0
     }

@@ -292,34 +292,7 @@ pub(crate) fn arithmetic(
         let (action, bytes, work) = operation_plan(op, &a, &z)?;
         b.charge_work(work)?;
         reserve_more(bytes, &mut reserved, b)?;
-        let value = match action {
-            Action::Zero => BigUint::ZERO,
-            Action::One => BigUint::from(1u32),
-            Action::Left => a.clone(),
-            Action::Right => z.clone(),
-            Action::Add => &a + &z,
-            Action::Mul => &a * &z,
-            Action::Pow(exponent) => a.pow(exponent),
-            Action::Sub => &a - &z,
-            Action::Div(divisor) => a.clone() / divisor,
-            Action::Mod(divisor) => &a % divisor,
-            Action::GeneralDiv => &a / &z,
-            Action::GeneralMod => &a % &z,
-            Action::Gcd => {
-                let (mut x, mut y) = (a.clone(), z.clone());
-                while y != BigUint::ZERO {
-                    let next = &x % &y;
-                    x = y;
-                    y = next;
-                }
-                x
-            }
-            Action::Land => &a & &z,
-            Action::Lor => &a | &z,
-            Action::Xor => &a ^ &z,
-            Action::ShiftLeft(n) => &a << n,
-            Action::ShiftRight(n) => &a >> n,
-        };
+        let value = apply(action, &a, &z);
         let bits = value.bits();
         let (bytes, work) = plans::format(bits)?;
         b.charge_work(work)?;
@@ -334,4 +307,249 @@ pub(crate) fn arithmetic(
             Err(error)
         }
     }
+}
+
+fn apply(action: Action, a: &BigUint, z: &BigUint) -> BigUint {
+    match action {
+        Action::Zero => BigUint::ZERO,
+        Action::One => BigUint::from(1u32),
+        Action::Left => a.clone(),
+        Action::Right => z.clone(),
+        Action::Add => a + z,
+        Action::Mul => a * z,
+        Action::Pow(exponent) => a.pow(exponent),
+        Action::Sub => a - z,
+        Action::Div(divisor) => a.clone() / divisor,
+        Action::Mod(divisor) => a % divisor,
+        Action::GeneralDiv => a / z,
+        Action::GeneralMod => a % z,
+        Action::Gcd => {
+            let (mut x, mut y) = (a.clone(), z.clone());
+            while y != BigUint::ZERO {
+                let next = &x % &y;
+                x = y;
+                y = next;
+            }
+            x
+        }
+        Action::Land => a & z,
+        Action::Lor => a | z,
+        Action::Xor => a ^ z,
+        Action::ShiftLeft(n) => a << n,
+        Action::ShiftRight(n) => a >> n,
+    }
+}
+
+// A value in a single value-kernel graph. All large values are normalized
+// magnitudes greater than u64::MAX, so a mixed pair cannot compare equal.
+#[derive(Clone)]
+pub(crate) struct BinaryNat(Magnitude);
+
+#[derive(Clone)]
+enum Magnitude {
+    Small(u64),
+    Big(BigUint),
+    Packed { limbs: usize, words: Vec<u32> },
+}
+
+impl BinaryNat {
+    pub(crate) fn small(value: u64) -> Self {
+        Self(Magnitude::Small(value))
+    }
+    pub(crate) fn as_small(&self) -> Option<u64> {
+        match self.0 {
+            Magnitude::Small(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn operand(
+        &self,
+        budget: &mut Budget,
+        scratch: &mut u64,
+    ) -> Result<std::borrow::Cow<'_, BigUint>, ResourceError> {
+        use std::borrow::Cow;
+        Ok(match &self.0 {
+            Magnitude::Small(n) => Cow::Owned(BigUint::from(*n)),
+            Magnitude::Big(n) => Cow::Borrowed(n),
+            Magnitude::Packed { limbs, words } => {
+                let length = *limbs as u64;
+                budget.charge_work(32 * (length + 4))?;
+                reserve_more(32 * (length + 4), scratch, budget)?;
+                let mut digits = Vec::new();
+                digits
+                    .try_reserve_exact(*limbs)
+                    .map_err(|_| ResourceError::Allocation)?;
+                let mut data = words.as_slice();
+                while digits.len() < *limbs {
+                    let (&mask, rest) = data.split_first().ok_or(ResourceError::Invariant)?;
+                    let width = 32.min(*limbs - digits.len());
+                    let (block, next) = rest
+                        .split_at_checked(mask.count_ones() as usize)
+                        .ok_or(ResourceError::Invariant)?;
+                    data = next;
+                    let start = digits.len();
+                    if mask == u32::MAX && width == 32 {
+                        digits.extend_from_slice(block);
+                    } else {
+                        digits.resize(start + width, 0);
+                        let mut bits = mask;
+                        for &word in block {
+                            let index = bits.trailing_zeros() as usize;
+                            *digits
+                                .get_mut(start + index)
+                                .ok_or(ResourceError::Invariant)? = word;
+                            bits &= bits - 1;
+                        }
+                    }
+                }
+                if !data.is_empty() {
+                    return Err(ResourceError::Invariant);
+                }
+                Cow::Owned(BigUint::new(digits))
+            }
+        })
+    }
+
+    pub(crate) fn compare(
+        &self,
+        rhs: &Self,
+        budget: &mut Budget,
+    ) -> Result<std::cmp::Ordering, ResourceError> {
+        use std::cmp::Ordering;
+        match (&self.0, &rhs.0) {
+            (Magnitude::Small(a), Magnitude::Small(b)) => return Ok(a.cmp(b)),
+            (Magnitude::Small(_), _) => return Ok(Ordering::Less),
+            (_, Magnitude::Small(_)) => return Ok(Ordering::Greater),
+            _ => {}
+        }
+        let mut scratch = 0;
+        let result = (|| {
+            let a = self.operand(budget, &mut scratch)?;
+            let b = rhs.operand(budget, &mut scratch)?;
+            budget.charge_work(a.bits().min(b.bits()).div_ceil(32) + 1)?;
+            Ok(a.cmp(&b))
+        })();
+        budget.release(scratch)?;
+        result
+    }
+}
+
+fn keep_binary(result: &BigUint, b: &mut Budget, retained: &mut u64) -> Result<BinaryNat, Error> {
+    if let Ok(small) = u64::try_from(result) {
+        return Ok(BinaryNat::small(small));
+    }
+    // Clone the normalized digits, not the possibly larger scratch capacity.
+    // The portable envelope covers the minimum allocation and rounding to a
+    // machine digit on both targets.
+    let limbs = result.bits().div_ceil(32);
+    if limbs > 256 {
+        b.charge_work(32 * (limbs + 4))?;
+        let count = result.iter_u32_digits().filter(|&digit| digit != 0).count() as u64
+            + limbs.div_ceil(32);
+        if count <= limbs - limbs.div_ceil(8) {
+            reserve_more(4 * count, retained, b)?;
+            let mut words = Vec::new();
+            words
+                .try_reserve_exact(usize::try_from(count).map_err(|_| ResourceError::Storage)?)
+                .map_err(|_| ResourceError::Allocation)?;
+            let mut digits = result.iter_u32_digits();
+            while digits.len() != 0 {
+                let mask_at = words.len();
+                words.push(0);
+                let mut mask = 0;
+                for (bit, digit) in digits.by_ref().take(32).enumerate() {
+                    if digit != 0 {
+                        mask |= 1 << bit;
+                        words.push(digit);
+                    }
+                }
+                words[mask_at] = mask;
+            }
+            return Ok(BinaryNat(Magnitude::Packed {
+                limbs: usize::try_from(limbs).map_err(|_| ResourceError::Storage)?,
+                words,
+            }));
+        }
+    }
+    b.charge_work(limbs + 1)?;
+    reserve_more(plans::mul(&[8, limbs + 4])?, retained, b)?;
+    Ok(BinaryNat(Magnitude::Big(result.clone())))
+}
+
+pub(crate) fn parse_binary(
+    bytes: &[u8],
+    b: &mut Budget,
+    retained: &mut u64,
+) -> Result<BinaryNat, Error> {
+    let (space, work) = parse_plan(bytes.len())?;
+    b.charge_work(work)?;
+    b.reserve(space)?;
+    let result = BigUint::parse_bytes(bytes, 10)
+        .ok_or(ResourceError::Invariant.into())
+        .and_then(|n| keep_binary(&n, b, retained));
+    b.release(space)?;
+    result
+}
+
+pub(crate) fn binary_arithmetic(
+    op: Operation,
+    left: &BinaryNat,
+    right: &BinaryNat,
+    b: &mut Budget,
+    retained: &mut u64,
+) -> Result<BinaryNat, Error> {
+    // Both potential u64-to-BigUint temporaries remain covered until drop.
+    let mut scratch = 0;
+    reserve_more(64, &mut scratch, b)?;
+    let result = (|| {
+        let a = left.operand(b, &mut scratch)?;
+        let z = right.operand(b, &mut scratch)?;
+        let (ab, bb) = (a.bits(), z.bits());
+        let product_bits = ab.checked_mul(u64::try_from(z.as_ref()).unwrap_or(u64::MAX));
+        let value = if op == Operation::Pow
+            && ab > 1
+            && ab <= 32
+            && product_bits.is_some_and(|n| n > SCALAR_FORMAT_BITS)
+            && !operation_plan(op, &a, &z).is_ok_and(|(_, space, work)| {
+                b.has_work_headroom(work) && b.has_storage_headroom(space)
+            })
+            && let Ok(exponent) = u32::try_from(z.as_ref())
+        {
+            // A fixed scalar multiply is linear in the current width. The final
+            // bound dominates every iteration of this pinned backend operation.
+            let limbs = (ab * u64::from(exponent)).div_ceil(32);
+            b.charge_work(plans::mul(&[64, limbs + 4, u64::from(exponent) + 1])?)?;
+            reserve_more(plans::mul(&[64, limbs + 4])?, &mut scratch, b)?;
+            let mut value = BigUint::from(1u32);
+            let factor = u32::try_from(a.as_ref()).map_err(|_| ResourceError::Invariant)?;
+            for _ in 0..exponent {
+                value *= factor;
+            }
+            value
+        } else {
+            let (action, space, work) = if op == Operation::Mul
+                && ab.min(bb) > 0
+                && ab.min(bb) <= 1024
+                && ab.max(bb) > SCALAR_FORMAT_BITS
+            {
+                // The shorter operand has at most 32 portable digits. This
+                // selects a schoolbook leaf even for an asymmetric wide pair.
+                let s = plans::add(&[ab.div_ceil(32), bb.div_ceil(32)])?;
+                let work = plans::add(&[
+                    plans::mul(&[128, ab.min(bb).div_ceil(32) + 2, s + 4])?,
+                    plans::mul(&[1024, s + 16])?,
+                ])?;
+                (Action::Mul, plans::mul(&[576, s + 16])?, work)
+            } else {
+                operation_plan(op, &a, &z)?
+            };
+            b.charge_work(work)?;
+            reserve_more(space, &mut scratch, b)?;
+            apply(action, &a, &z)
+        };
+        keep_binary(&value, b, retained)
+    })();
+    b.release(scratch)?;
+    result
 }

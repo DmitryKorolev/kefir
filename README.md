@@ -117,10 +117,8 @@ IN=path/to/export.ndjson ./target/release/kefir
 
 For a build tuned to the machine it runs on, use
 `RUSTFLAGS="-C target-cpu=native" cargo build --release --locked`.
-The Lean Kernel Arena native entry also uses profile-guided optimization (PGO),
-trained on the `Init.Prelude` export; its complete build recipe is in the Arena
-checker configuration. Native code generation and PGO change no checking outcome
-or resource accounting. The ordinary build above remains the reference build.
+The Lean Kernel Arena uses this target-native command for its native entry.
+The ordinary build above remains the reference build.
 
 The CLI reads the file named by `IN` and writes its JSON report to stdout.
 It does not elaborate Lean source or run tactics. The same checker is available

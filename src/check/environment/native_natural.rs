@@ -7,15 +7,17 @@ mod group;
 mod manifest;
 mod matching;
 
+const PIN_COUNT: usize = manifest::PIN_CLOSURE_MASKS.len();
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct Certificate {
-    masks: [[u32; manifest::MASK_WORDS]; 2],
+    masks: [[u32; manifest::MASK_WORDS]; PIN_COUNT],
     slots: [u32; 6],
     frontiers: [u32; 6],
 }
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Certificate>() == 160);
-const _: () = assert!(manifest::PIN_CLOSURE_MASKS.len() == 2);
+const _: () = assert!(size_of::<Certificate>() == 216);
+const _: () = assert!(PIN_COUNT == manifest::OPERATION_CLOSURES.len());
 impl Certificate {
     pub(super) fn complete(&self) -> bool {
         self.frontiers.iter().all(|&x| x != 0)
@@ -39,7 +41,7 @@ impl Certificate {
             .all(|((&required, present), &own)| required & !(present | own) == 0))
     }
     fn insert(&mut self, pin: usize, referent: usize, slot: u32) -> Result<(), ResourceError> {
-        if pin >= 2 || referent >= manifest::REFERENTS || slot == 0 {
+        if pin >= PIN_COUNT || referent >= manifest::REFERENTS || slot == 0 {
             return Err(ResourceError::Invariant);
         }
         self.masks[pin][referent / 32] |= 1 << (referent % 32);
@@ -59,7 +61,7 @@ impl Certificate {
             if self.frontiers[i] != 0 {
                 continue;
             }
-            if (0..2).any(|pin| {
+            if (0..PIN_COUNT).any(|pin| {
                 self.masks[pin]
                     .iter()
                     .zip(manifest::OPERATION_CLOSURES[pin][i])
@@ -133,7 +135,7 @@ fn candidate(actual: NameId, n: &Names, b: &mut Budget) -> Result<Option<usize>,
         Component::String(s) => s.len(),
         Component::Number(s) => s.len(),
     };
-    // Nine binary-search comparisons suffice for 432 entries; charge their
+    // Nine binary-search comparisons suffice for 443 entries; charge their
     // possible input-byte work together, before inspecting component contents.
     b.charge_work(
         (length as u64)
@@ -244,7 +246,7 @@ impl Environment {
             }
             let pins = manifest::ALTERNATIVE_PIN_MASKS[index];
             let mut eligible = 0;
-            for pin in 0..2 {
+            for pin in 0..PIN_COUNT {
                 if pins & (1 << pin) != 0
                     && previous.dependencies(pin, row[10], &[0; manifest::MASK_WORDS])?
                 {
@@ -282,7 +284,7 @@ impl Environment {
                 .committed
                 .checked_add(1)
                 .ok_or(ResourceError::Counter)?;
-            for pin in 0..2 {
+            for pin in 0..PIN_COUNT {
                 if eligible & (1 << pin) != 0 {
                     next.insert(pin, referent, slot)?;
                 }

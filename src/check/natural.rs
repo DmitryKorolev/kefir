@@ -5,7 +5,7 @@ use num_bigint::BigUint;
 
 mod arithmetic;
 mod plans;
-pub(crate) use arithmetic::{Operation, arithmetic};
+pub(crate) use arithmetic::{BinaryNat, Operation, arithmetic, binary_arithmetic, parse_binary};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
