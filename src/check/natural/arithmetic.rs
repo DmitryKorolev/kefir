@@ -442,17 +442,22 @@ pub(crate) fn binary_arithmetic(
             })
             && let Ok(exponent) = u32::try_from(z.as_ref())
         {
-            // A fixed scalar multiply is linear in the current width. The final
-            // bound dominates every iteration of this pinned backend operation.
-            let limbs = (ab * u64::from(exponent)).div_ceil(32);
-            b.charge_work(plans::mul(&[64, limbs + 4, u64::from(exponent) + 1])?)?;
-            reserve_more(plans::mul(&[64, limbs + 4])?, &mut scratch, b)?;
-            let mut value = BigUint::from(1u32);
             let factor = u32::try_from(a.as_ref()).map_err(|_| ResourceError::Invariant)?;
-            for _ in 0..exponent {
-                value *= factor;
+            if let Ok((space, work)) = plans::wide_scalar_power(ab, exponent)
+                && b.has_work_headroom(work)
+                && b.has_storage_headroom(space)
+            {
+                b.charge_work(work)?;
+                reserve_more(space, &mut scratch, b)?;
+                square_power(factor, exponent)
+            } else {
+                // The final width dominates each scalar step and the bounded
+                // planning pass. No square from the refused plan was run.
+                let limbs = (ab * u64::from(exponent)).div_ceil(32);
+                b.charge_work(plans::mul(&[64, limbs + 4, u64::from(exponent) + 1])?)?;
+                reserve_more(plans::mul(&[64, limbs + 4])?, &mut scratch, b)?;
+                scalar_power(factor as usize, exponent)
             }
-            value
         } else {
             let asymmetric = op == Operation::Mul
                 && ab.min(bb) > 0
@@ -485,6 +490,40 @@ pub(crate) fn binary_arithmetic(
     result
 }
 
+/// At the start of each step, the accumulator is the power whose exponent
+/// is the already consumed prefix. A bit doubles that exponent and adds
+/// one when set, matching the schedule charged by `wide_scalar_power`.
+fn square_power(base: u32, exponent: u32) -> BigUint {
+    let mut value = BigUint::from(base);
+    for bit in (0..exponent.ilog2()).rev() {
+        value = &value * &value;
+        if exponent & (1 << bit) != 0 {
+            value *= base;
+        }
+    }
+    value
+}
+
+/// Precondition: the admitted base is at least two and fits in a backend digit.
+fn scalar_power(base: usize, exponent: u32) -> BigUint {
+    debug_assert!(base >= 2);
+    // In the pinned backend, usize multiplication uses a single digit on both
+    // supported pointer widths. Every intermediate remains a power of base
+    // with exponent at most the original exponent, so the same plan covers it.
+    let mut digit = base;
+    let mut width = 1;
+    while let Some(next) = digit.checked_mul(base) {
+        digit = next;
+        width += 1;
+    }
+
+    let mut value = BigUint::from(base.pow(exponent % width));
+    for _ in 0..exponent / width {
+        value *= digit;
+    }
+    value
+}
+
 /// Each set bit in `long` contributes one shifted copy of `short`.
 /// Disjoint bit ranges add with no carries; overlap abandons this shortcut.
 /// The caller has already reserved the full asymmetric multiplication envelope.
@@ -510,10 +549,28 @@ fn separated_product(
     out.try_reserve_exact(length)
         .map_err(|_| ResourceError::Allocation)?;
     out.resize(length, 0u32);
+    #[cfg(target_pointer_width = "64")]
+    let mut cached = [0u32; 32];
+    #[cfg(target_pointer_width = "64")]
+    let digits = {
+        let digits = cached
+            .get_mut(..width.div_ceil(32) as usize)
+            .ok_or(ResourceError::Invariant)?;
+        for (slot, limb) in digits.iter_mut().zip(short.iter_u32_digits()) {
+            *slot = limb;
+        }
+        &*digits
+    };
+    // Match the backend's physical digits. Its u64 iterator on the 32-bit
+    // target assembles pairs while walking the mostly zero long operand.
+    #[cfg(target_pointer_width = "64")]
+    let (long_digits, word_bits) = (long.iter_u64_digits(), 64);
+    #[cfg(target_pointer_width = "32")]
+    let (long_digits, word_bits) = (long.iter_u32_digits(), 32);
     let mut next = 0;
-    for (i, mut bits) in long.iter_u32_digits().enumerate() {
+    for (i, mut bits) in long_digits.enumerate() {
         while bits != 0 {
-            let pos = 32 * i as u64 + u64::from(bits.trailing_zeros());
+            let pos = word_bits * i as u64 + u64::from(bits.trailing_zeros());
             if pos < next {
                 return Ok(None);
             }
@@ -522,7 +579,11 @@ fn separated_product(
             let shift = pos % 32;
             let mut carry = 0;
             let mut end = start;
-            for word in short.iter_u32_digits() {
+            #[cfg(target_pointer_width = "64")]
+            let short_digits = digits.iter().copied();
+            #[cfg(target_pointer_width = "32")]
+            let short_digits = short.iter_u32_digits();
+            for word in short_digits {
                 let part = (u64::from(word) << shift) | carry;
                 out[end] |= part as u32;
                 carry = part >> 32;

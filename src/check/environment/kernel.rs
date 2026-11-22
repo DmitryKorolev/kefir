@@ -5838,7 +5838,13 @@ impl<'e, 'w> Kernel<'e, 'w> {
                             Err(e) => return Err(e),
                         }
                     }
-                    if x < y {
+                    if let Some((left, exposed)) = self.expose_shared_argument(a, c)? {
+                        if left {
+                            a = exposed;
+                        } else {
+                            c = exposed;
+                        }
+                    } else if x < y {
                         c = self.unfold_value(c)?;
                     } else if y < x {
                         a = self.unfold_value(a)?;
@@ -5854,6 +5860,63 @@ impl<'e, 'w> Kernel<'e, 'w> {
             if let Some(r) = self.quick(a, c)? {
                 return Ok(Lazy::Decided(r));
             }
+        }
+    }
+    /// A visible argument is only a scheduling hint. Keep the opposite head
+    /// intact through a short chain of reductions, then resume ordinary
+    /// comparison, including its universe checks, on the actual reduct.
+    fn expose_shared_argument(&mut self, a: u32, c: u32) -> R<Option<(bool, u32)>> {
+        let (
+            Val::Const {
+                ci: ca, spine: sa, ..
+            },
+            Val::Const {
+                ci: cc, spine: sc, ..
+            },
+        ) = (self.vals[a as usize], self.vals[c as usize])
+        else {
+            return Ok(None);
+        };
+        let (left, mut exposed, spine, target) = match (sa, sc) {
+            (0, s) if s != 0 => (false, c, s, ca),
+            (s, 0) if s != 0 => (true, a, s, cc),
+            _ => return Ok(None),
+        };
+        let last = self.cells[spine as usize];
+        if ca == cc || ![last, self.cells[last.prev as usize]].iter().any(|cell|
+            cell.len != 0 && cell.tag == 0 &&
+            matches!(self.vals[cell.item as usize], Val::Const { ci, spine: 0, .. } if ci == target)
+        ) {
+            return Ok(None);
+        }
+        let saved = self.bounds;
+        let depth = self.binders.len();
+        self.limit_total(self.steps.saturating_add(512));
+        let result = (|| {
+            for _ in 0..4 {
+                let Val::Const { ci, spine, .. } = self.vals[exposed as usize] else {
+                    break;
+                };
+                if spine == 0 || self.const_view(ci)?.delta.is_none() {
+                    break;
+                }
+                self.steps_by(1 + u64::from(self.cells[spine as usize].len))?;
+                exposed = self.unfold_value(exposed)?;
+                if matches!(self.vals[exposed as usize], Val::Const { ci, spine: 0, .. } if ci == target)
+                {
+                    return Ok(Some((left, exposed)));
+                }
+            }
+            Ok(None)
+        })();
+        self.restore_bounds(saved);
+        self.binders.truncate(depth);
+        match result {
+            Err(e @ (KErr::Resource(_) | KErr::LiteralArithmetic | KErr::StepLimit)) => Err(e),
+            Err(KErr::Abort) if self.steps > self.limit => Err(KErr::Abort),
+            _ if self.steps > step_cap() => step_limit(),
+            Err(KErr::Unsupported | KErr::Abort) => Ok(None),
+            r => r,
         }
     }
     /// A projection opposite a delta head may hide the same cheap head. Expose

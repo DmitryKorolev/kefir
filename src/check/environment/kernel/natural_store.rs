@@ -21,12 +21,16 @@ pub(super) struct Store {
     entries: Vec<Resident>,
     clock: u64,
     bytes: u64,
+    power_bytes: u64,
+    power_slots: usize,
 }
 
 // Memory threshold uses portable charged bytes, including the retained backend
 // envelope. An oversize operand (and its pinned partner) may be live while used.
 const BYTES: u64 = 16 << 20;
 const SLOTS: usize = 256;
+const PREFERRED_POWER_BYTES: u64 = BYTES / 4;
+const PREFERRED_POWER_SLOTS: usize = SLOTS / 16;
 
 impl Kernel<'_, '_> {
     /// Input IDs name earlier completed naturals in this graph (NONE denotes zero).
@@ -78,10 +82,14 @@ impl Kernel<'_, '_> {
         pin: u32,
     ) -> R<()> {
         let store = &mut self.natural_store;
+        let power = recipe.op == Operation::Pow;
         while !store.entries.is_empty()
             && (store.entries.len() >= SLOTS || store.bytes + bytes > BYTES)
         {
             self.b.charge_work(store.entries.len() as u64)?;
+            let prefer_powers = store.power_slots != 0
+                && store.power_slots + usize::from(power) <= PREFERRED_POWER_SLOTS
+                && store.power_bytes + if power { bytes } else { 0 } <= PREFERRED_POWER_BYTES;
             let mut oldest = None;
             for (index, entry) in store.entries.iter().enumerate() {
                 if entry.id == pin {
@@ -90,8 +98,12 @@ impl Kernel<'_, '_> {
                 let NatLit::Computed(_, touched) = &self.nats[entry.id as usize] else {
                     return Err(ResourceError::Invariant.into());
                 };
-                if oldest.is_none_or(|(_, age)| touched.get() < age) {
-                    oldest = Some((index, touched.get()));
+                let order = (
+                    prefer_powers && entry.recipe.op == Operation::Pow,
+                    touched.get(),
+                );
+                if oldest.is_none_or(|(_, current)| order < current) {
+                    oldest = Some((index, order));
                 }
             }
             let Some((index, _)) = oldest else { break };
@@ -103,10 +115,18 @@ impl Kernel<'_, '_> {
                 .checked_sub(entry.bytes)
                 .ok_or(ResourceError::Invariant)?;
             store.bytes -= entry.bytes;
+            if entry.recipe.op == Operation::Pow {
+                store.power_bytes -= entry.bytes;
+                store.power_slots -= 1;
+            }
         }
         room(self.b, &mut self.reserved, &mut store.entries, 1)?;
         store.entries.push(Resident { id, recipe, bytes });
         store.bytes += bytes;
+        if power {
+            store.power_bytes += bytes;
+            store.power_slots += 1;
+        }
         Ok(())
     }
 

@@ -26,6 +26,10 @@ pub(super) fn parse(d: u64) -> Result<(u64, u64), Error> {
 }
 
 pub(super) fn multiply(s: u64) -> Result<(u64, u64), Error> {
+    multiply_with_node_cap(s, u64::MAX)
+}
+
+fn multiply_with_node_cap(s: u64, node_cap: u64) -> Result<(u64, u64), Error> {
     let q = s.saturating_sub(6).max(1);
     let r = add(&[s, 16])?;
     let h = 2 * u64::from(u64::BITS - q.leading_zeros()) + 1;
@@ -34,8 +38,39 @@ pub(super) fn multiply(s: u64) -> Result<(u64, u64), Error> {
     let nodes = add(&[1, mul(&[5, mul(&[q, q])? / 400])?])?;
     Ok((
         mul(&[576, r])?,
-        add(&[mul(&[1024, h, r, r])?, mul(&[1024, r, nodes])?])?,
+        add(&[
+            mul(&[1024, h, r, r])?,
+            mul(&[1024, r, nodes.min(node_cap)])?,
+        ])?,
     ))
+}
+
+/// Quote left-to-right exponentiation of a single-word base.
+pub(super) fn wide_scalar_power(base_bits: u64, exponent: u32) -> Result<(u64, u64), Error> {
+    let mut prefix = 1;
+    let mut work = 64 * u64::from(exponent.ilog2() + 4);
+    for bit in (0..exponent.ilog2()).rev() {
+        let digits = mul(&[base_bits, prefix])?.div_ceil(32);
+        // At most 5/4 * max(digits - 3, 1)^(3/2) principal nodes.
+        // Use the same 32-bit digit upper bound on both targets.
+        let width = digits.saturating_sub(3).max(1);
+        let root = width.isqrt();
+        let ceil_root = root + u64::from(root * root != width);
+        let nodes = mul(&[5, width, ceil_root])?.div_ceil(4);
+        let (_, square) = multiply_with_node_cap(mul(&[2, digits])?, nodes)?;
+        work = add(&[work, square])?;
+        prefix *= 2;
+        if exponent & (1 << bit) != 0 {
+            let digits = mul(&[base_bits, prefix])?.div_ceil(32);
+            work = add(&[work, mul(&[64, digits + 4])?])?;
+            prefix += 1;
+        }
+    }
+    // The original whole-power workspace bound covers the old power,
+    // the square and its scratch, and scalar growth.
+    let n = add(&[mul(&[base_bits, prefix])?.div_ceil(32), 1])?;
+    let space = add(&[mul(&[96, n])?, mul(&[576, n + 16])?])?;
+    Ok((space, work))
 }
 
 pub(super) fn format(bits: u64) -> Result<(u64, u64), Error> {
