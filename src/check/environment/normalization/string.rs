@@ -26,6 +26,53 @@ pub(super) fn expand(
     expand_symbols(root, incoming, symbols, expressions, levels, names, budget)
 }
 
+/// The operands are already checked under the comparison scope. The caller
+/// supplies the literal and function child of an exact one-argument application.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn expand_matching_of_list(
+    literal: ExprId,
+    function: ExprId,
+    incoming: ReductionPath,
+    scope: Scope<'_>,
+    environment: &Environment,
+    expressions: &mut Expressions,
+    levels: &Levels,
+    names: &Names,
+    budget: &mut Budget,
+) -> Result<Option<Head>, HeadError> {
+    let ExprKind::Constant(name, []) =
+        expressions
+            .get(function, budget)?
+            .kind(expressions, levels, budget)?
+    else {
+        return Ok(None);
+    };
+    let Some(symbols) = environment.string_symbols(
+        scope.before,
+        scope.formation,
+        scope.expression_end,
+        expressions,
+        levels,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
+    if names.summary(name, budget)?.canonical != names.summary(symbols[4], budget)?.canonical {
+        return Ok(None);
+    }
+    expand_symbols(
+        literal,
+        incoming,
+        symbols,
+        expressions,
+        levels,
+        names,
+        budget,
+    )
+    .map(Some)
+}
+
 // Caller supplies the exact committed certificate symbols; tests exercise only
 // this construction/retirement protocol, not semantic certificate admission.
 fn expand_symbols(

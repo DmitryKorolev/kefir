@@ -2,6 +2,14 @@
 use super::super::normalization::full::comparison::Evidence;
 use super::*;
 
+/// Context locals belong to the ordinary checker. A fresh local is the single
+/// value-free Nat introduced by this independently checked witness attempt.
+#[derive(Clone, Copy)]
+enum BlockerRoot {
+    Context,
+    Fresh(u32),
+}
+
 impl Kernel<'_, '_> {
     fn data_family(&mut self, value: u32, family: u32, bare: bool) -> R<bool> {
         let Some(ty) = self.infer_value(value)? else {
@@ -44,7 +52,42 @@ impl Kernel<'_, '_> {
     }
     /// Only a checked Nat/Bool recursor chain ending in a value-free local can
     /// certify a stuck major. Extra applications never change the major slot.
-    fn check_blocker(&mut self, mut n: u32, mut trim: u8) -> R<bool> {
+    fn check_blocker(&mut self, n: u32, trim: u8) -> R<bool> {
+        self.rigid_blocker(n, trim, BlockerRoot::Context)
+    }
+
+    pub(super) fn symbolic_bool_difference(
+        &mut self,
+        a: u32,
+        b: u32,
+        family: u32,
+        fresh: u32,
+    ) -> R<bool> {
+        let Some(name) = self.env.natural_predicate_constructor(false) else {
+            return Ok(false);
+        };
+        let bci = self.const_info(name)?;
+        if !matches!(self.const_view(bci)?.ctor, Some((f, _)) if f == family) {
+            return Ok(false);
+        }
+        let (a, b) = (self.whnf(a)?, self.whnf(b)?);
+        for (candidate, neutral) in [(a, b), (b, a)] {
+            let Val::Const {
+                ci,
+                li: 0,
+                spine: 0,
+            } = self.vals[candidate as usize]
+            else {
+                continue;
+            };
+            if matches!(self.const_view(ci)?.ctor,Some((f,_)) if f==family) {
+                return self.rigid_blocker(neutral, 0, BlockerRoot::Fresh(fresh));
+            }
+        }
+        Ok(false)
+    }
+
+    fn rigid_blocker(&mut self, mut n: u32, mut trim: u8, root: BlockerRoot) -> R<bool> {
         let Some((nat, _, _)) = self.nat_ctors()? else {
             return Ok(false);
         };
@@ -56,13 +99,21 @@ impl Kernel<'_, '_> {
         let Some((boolean, _)) = self.const_view(bci)?.ctor else {
             return Ok(false);
         };
-        for _ in 0..10 {
+        let links = match root {
+            BlockerRoot::Context => 10,
+            BlockerRoot::Fresh(_) => 1024,
+        };
+        for _ in 0..links {
             self.step()?;
             let wh = self.whnf(n)?;
             if let Val::Local { spine: 0, .. } = self.vals[wh as usize] {
-                return Ok(trim == 0 && self.context_neutral(wh)?);
+                return Ok(trim == 0
+                    && match root {
+                        BlockerRoot::Context => self.context_neutral(wh)?,
+                        BlockerRoot::Fresh(local) => wh == local,
+                    });
             }
-            let Val::Const { ci, mut spine, .. } = self.vals[wh as usize] else {
+            let Val::Const { ci, li, mut spine } = self.vals[wh as usize] else {
                 return Ok(false);
             };
             let Some(rec) = self.const_view(ci)?.rec else {
@@ -74,6 +125,11 @@ impl Kernel<'_, '_> {
                 || (rec.family != nat && rec.family != boolean)
                 || self.const_view(ci)?.delta.is_some()
                 || self.const_view(ci)?.quot.is_some()
+            {
+                return Ok(false);
+            }
+            if matches!(root, BlockerRoot::Fresh(_))
+                && (self.natop(ci)?.is_some() || self.natpred(ci)?.is_some())
             {
                 return Ok(false);
             }
@@ -94,7 +150,36 @@ impl Kernel<'_, '_> {
                 self.step()?;
                 let p = self.cells[spine as usize];
                 if p.tag != 0 {
-                    return Ok(false);
+                    if matches!(root, BlockerRoot::Context) {
+                        return Ok(false);
+                    }
+                    // A projection is stuck only on a rigid structure. Validate
+                    // its actual prefix and field in this typed local context.
+                    let st = *self.const_view(p.item)?;
+                    if !st.ind.is_some_and(|i| i.structure_like()) {
+                        return Ok(false);
+                    }
+                    let prefix = self.push(Val::Const {
+                        ci,
+                        li,
+                        spine: p.prev,
+                    })?;
+                    if !self.data_family(prefix, st.canon, false)? {
+                        return Ok(false);
+                    }
+                    let Some(xt) = self.infer_value(prefix)? else {
+                        return Ok(false);
+                    };
+                    let ft = self.proj_type(prefix, xt, p.tag - 1, p.item, true)?;
+                    let Some(sort) = self.infer_value(ft)? else {
+                        return Ok(false);
+                    };
+                    let level = self.sort_of(sort)?;
+                    if self.levels.get(level, self.b)?.positive()
+                        != crate::syntax::levels::LevelPositive::Proven
+                    {
+                        return Ok(false);
+                    }
                 }
                 spine = p.prev;
             }

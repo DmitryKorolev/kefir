@@ -36,6 +36,7 @@ pub(crate) enum Stop {
     Resource(ResourceError),
     Copy(crate::check::theorem_copy::Error),
     Unsupported,
+    ProbeYield,
     Normalization(HeadError),
     Scope(ScopeError),
     Expression(ExpressionError),
@@ -84,7 +85,7 @@ impl Stop {
             // Positive-only clients cannot publish a negative. Declaration
             // completion consumes this separately after successful retirement.
             Self::Judgment(_) => Self::Unsupported.report(),
-            Self::Unsupported => FailureReport {
+            Self::Unsupported | Self::ProbeYield => FailureReport {
                 outcome: FailureOutcome::Decline,
                 code: "support.semantic",
             },
@@ -146,6 +147,24 @@ enum SelectedSource {
 }
 
 impl Interrupted {
+    fn trial_inconclusive(&self) -> bool {
+        self.cleanup.is_none()
+            && self.operation.is_some()
+            && [self.operation, self.owned_work]
+                .into_iter()
+                .flatten()
+                .all(|stop| {
+                    matches!(
+                        stop,
+                        Stop::Unsupported
+                            | Stop::ProbeYield
+                            | Stop::Normalization(HeadError::Unsupported)
+                            | Stop::Inference(HeadError::Unsupported)
+                            | Stop::Observation(HeadError::Unsupported)
+                    )
+                })
+    }
+
     fn completed_negative(&self) -> Option<Negative> {
         if self.cleanup.is_some() {
             return None;
@@ -232,6 +251,9 @@ pub(crate) struct Working<'a> {
     original_expressions: usize,
     original_levels: usize,
     caches: SessionCacheBudget,
+    // Maximum charged work at the next ordinary dispatcher boundary. The
+    // mandatory budget still admits and charges each complete operation.
+    probe_deadline: u64,
     // One declaration-wide admission limit for the optional closed-value
     // comparison route. Exhaustion falls through to the established driver.
     value_force_calls: u32,
@@ -263,6 +285,13 @@ impl Working<'_> {
     pub(crate) fn pre_staging_sorts(&self) -> bool {
         self.pre_staging_sorts
     }
+    pub(crate) fn begin_witness_probe(&mut self) {
+        self.probe_deadline = self.budget.snapshot().work_charged.saturating_add(1 << 20);
+        // The separate closed-value evaluator has its own force schedule.
+        // Leave it to the full ordinary fallback after an inconclusive probe.
+        self.value_force_calls = u32::MAX;
+    }
+
     /// Only the nested validator records its owned cleanup at callback exit.
     /// After this call it may retire further owners, but must perform no checking
     /// or publication. The Environment retires before callback exit in all cases.
@@ -460,6 +489,25 @@ impl Decoder {
     ) -> Result<Option<Negative>, Interrupted> {
         self.ordinary_session_inner(budget, work, true)
     }
+    /// A trial may yield to the full independent algorithm only after clean
+    /// retirement. The fallback must itself finish the original declaration
+    /// or return a typed failure. A missed witness supplies no conclusion.
+    pub(crate) fn declaration_with_deferred_witness(
+        &mut self,
+        budget: &mut Budget,
+        work: impl FnOnce(&mut Working<'_>, &mut bool) -> Result<(), Stop>,
+        fallback: impl FnOnce(&mut Working<'_>) -> Result<(), Stop>,
+    ) -> Result<Option<Negative>, Interrupted> {
+        let mut deferred = false;
+        match self.declaration_session(budget, |w| work(w, &mut deferred)) {
+            Err(error) if deferred && error.trial_inconclusive() => {}
+            result => return result,
+        }
+        self.failure = None;
+        #[cfg(feature = "introspection")]
+        budget.clear_trial_failure();
+        self.declaration_session(budget, fallback)
+    }
     fn ordinary_session_inner(
         &mut self,
         budget: &mut Budget,
@@ -498,6 +546,7 @@ impl Decoder {
             original_expressions: expression_end,
             original_levels: level_end,
             caches: SessionCacheBudget::default(),
+            probe_deadline: u64::MAX,
             value_force_calls: 0,
             pre_staging_sorts: false,
             owned_failure: None,

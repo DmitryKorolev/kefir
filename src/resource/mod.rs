@@ -196,6 +196,11 @@ impl Budget {
     }
 
     #[cfg(feature = "introspection")]
+    pub(crate) fn clear_trial_failure(&mut self) {
+        self.failure_snapshot = None;
+    }
+
+    #[cfg(feature = "introspection")]
     pub(crate) fn replace_failure(&mut self, snapshot: crate::report::failure_snapshot::Snapshot) {
         self.failure_snapshot = Some(snapshot);
     }

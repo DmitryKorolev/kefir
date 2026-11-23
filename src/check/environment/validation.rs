@@ -4,7 +4,7 @@ use crate::check::environment::normalization::{Mode, Scope};
 use crate::decode::primitive_decode::{
     Decoder,
     declarations::{Kind, Request, Safety, policy::Marker},
-    ordinary_session::Stop,
+    ordinary_session::{Negative, Stop, Working},
 };
 use crate::report::axiom_report::Axioms;
 use crate::resource::{
@@ -79,7 +79,7 @@ fn capture_ordinary(
         }
         Stop::Normalization(_) | Stop::Observation(_) | Stop::Expression(_) => &[Rule::Inference],
         Stop::Copy(_) => &[Rule::Formation],
-        Stop::Unsupported => &[Rule::Inference],
+        Stop::Unsupported | Stop::ProbeYield => &[Rule::Inference],
         Stop::Resource(_) => &[Rule::Inference],
     };
     let identities = [
@@ -311,116 +311,156 @@ impl State {
         // single Decoder throughout; generated/staged requests never enter here.
         let theorem_key = self.theorem_judgments.key(request, axiom_policy);
         let theorem_work_before = budget.snapshot().work_charged;
-        let formation_negative = decoder
-            .declaration_session(budget, |work| {
+        let witness = |work: &mut Working<'_>, bound_naturals| {
+            super::kernel::different_theorem(
+                &self.environment,
+                request,
+                &scope(),
+                work.names,
+                work.expressions,
+                work.levels,
+                work.budget,
+                bound_naturals,
+            )
+            .map_err(Stop::Normalization)
+        };
+        let ordinary = |work: &mut Working<'_>| {
+            #[cfg(feature = "introspection")]
+            let mut captured_roots = (request.ty, request.value);
+            #[cfg(feature = "introspection")]
+            let mut compared = None;
+            let result = (|| {
+                let (value, ty) = if request.kind == Kind::Theorem {
+                    let (value, ty) =
+                        work.copy_theorem(request.value.ok_or(Stop::Unsupported)?, request.ty)?;
+                    (Some(value), ty)
+                } else {
+                    (request.value, request.ty)
+                };
                 #[cfg(feature = "introspection")]
-                let mut captured_roots = (request.ty, request.value);
-                #[cfg(feature = "introspection")]
-                let mut compared = None;
-                let result = (|| {
-                    // The decoded roots themselves, before any route
-                    // copies or evaluates them.
-                    let originals = [request.ty, request.value.unwrap_or(request.ty)];
-                    work.check_input_scope(request.parameters, &originals)?;
-                    // Isolated value-kernel trial: a completed positive check
-                    // replaces the ordinary route; anything else falls through
-                    // to it unchanged. Mandatory resource errors stay terminal.
-                    let kernel_scope = scope();
-                    if super::kernel::eligible(request, &kernel_scope) {
-                        if self
-                            .theorem_judgments
-                            .lookup(theorem_key, work.budget)
-                            .map_err(Stop::Resource)?
-                        {
-                            // Only repeated T : Prop and p : T are discharged.
-                            // Session cleanup and all publication checks below
-                            // remain mandatory. Admitted axioms are monotonic
-                            // in this State, collected at every axiom install.
-                            return Ok(());
-                        }
-                        if super::kernel::check(
-                            &self.environment,
-                            request,
-                            &kernel_scope,
-                            work.names,
-                            work.expressions,
-                            work.levels,
-                            work.budget,
-                            Some(&mut self.retention),
-                        )
-                        .map_err(Stop::Normalization)?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    if super::kernel::different_theorem(&self.environment,request,&kernel_scope,work.names,work.expressions,work.levels,work.budget).map_err(Stop::Normalization)? {
-                        return Err(Stop::Judgment(crate::decode::primitive_decode::ordinary_session::Negative::TypeMismatch))
-                    }
-                    let (value, ty) = if request.kind == Kind::Theorem {
-                        let (value, ty) =
-                            work.copy_theorem(request.value.ok_or(Stop::Unsupported)?, request.ty)?;
-                        (Some(value), ty)
+                {
+                    captured_roots = (ty, value);
+                }
+                // Non-theorem roots are the originals checked above; only a
+                // theorem's generated copy needs its own scope check.
+                if request.kind == Kind::Theorem {
+                    if let Some(value) = value {
+                        work.check_root_scope(request.parameters, &[ty, value])?;
                     } else {
-                        (request.value, request.ty)
-                    };
+                        work.check_root_scope(request.parameters, &[ty])?;
+                    }
+                }
+                let type_path = work.check_type(
+                    ty,
+                    request.kind == Kind::Theorem,
+                    ReductionPath::start(),
+                    scope(),
+                    &self.environment,
+                )?;
+                if let Some(value) = value {
+                    let body_type =
+                        work.infer_at(value, ReductionPath::start(), scope(), &self.environment)?;
+                    let incoming = type_path.maximum(body_type.path);
                     #[cfg(feature = "introspection")]
                     {
-                        captured_roots = (ty, value);
+                        compared = Some(crate::report::failure_snapshot::Mismatch {
+                            expected: ty,
+                            actual: body_type.ty,
+                        });
                     }
-                    // Non-theorem roots are the originals checked above; only a
-                    // theorem's generated copy needs its own scope check.
-                    if request.kind == Kind::Theorem {
-                        if let Some(value) = value {
-                            work.check_root_scope(request.parameters, &[ty, value])?;
-                        } else {
-                            work.check_root_scope(request.parameters, &[ty])?;
-                        }
-                    }
-                    let type_path = work.check_type(
+                    work.compare_checked_types(
+                        body_type.ty,
                         ty,
-                        request.kind == Kind::Theorem,
-                        ReductionPath::start(),
+                        incoming,
                         scope(),
                         &self.environment,
                     )?;
-                    if let Some(value) = value {
-                        let body_type = work.infer_at(
-                            value,
-                            ReductionPath::start(),
-                            scope(),
-                            &self.environment,
-                        )?;
-                        let incoming = type_path.maximum(body_type.path);
-                        #[cfg(feature = "introspection")]
-                        {
-                            compared = Some(crate::report::failure_snapshot::Mismatch {
-                                expected: ty,
-                                actual: body_type.ty,
-                            });
-                        }
-                        work.compare_checked_types(
-                            body_type.ty,
-                            ty,
-                            incoming,
-                            scope(),
-                            &self.environment,
-                        )?;
-                    }
-                    Ok(())
-                })();
-                #[cfg(feature = "introspection")]
-                if let Err(error) = result {
-                    capture_ordinary(
-                        work,
-                        request,
-                        error,
-                        captured_roots.0,
-                        captured_roots.1,
-                        compared,
-                    );
                 }
-                result
-            })
+                Ok(())
+            })();
+            #[cfg(feature = "introspection")]
+            if let Err(error) = result {
+                capture_ordinary(
+                    work,
+                    request,
+                    error,
+                    captured_roots.0,
+                    captured_roots.1,
+                    compared,
+                );
+            }
+            result
+        };
+        let fast = |work: &mut Working<'_>, deferred: &mut bool| {
+            let result = (|| {
+                // The decoded roots themselves, before any route
+                // copies or evaluates them.
+                let originals = [request.ty, request.value.unwrap_or(request.ty)];
+                work.check_input_scope(request.parameters, &originals)?;
+                // Isolated value-kernel trial: a completed positive check
+                // replaces the ordinary route; anything else falls through
+                // to it unchanged. Mandatory resource errors stay terminal.
+                let kernel_scope = scope();
+                if super::kernel::eligible(request, &kernel_scope) {
+                    if self
+                        .theorem_judgments
+                        .lookup(theorem_key, work.budget)
+                        .map_err(Stop::Resource)?
+                    {
+                        // Only repeated T : Prop and p : T are discharged.
+                        // Session cleanup and all publication checks below
+                        // remain mandatory. Admitted axioms are monotonic
+                        // in this State, collected at every axiom install.
+                        return Ok(());
+                    }
+                    if super::kernel::check(
+                        &self.environment,
+                        request,
+                        &kernel_scope,
+                        work.names,
+                        work.expressions,
+                        work.levels,
+                        work.budget,
+                        Some(&mut self.retention),
+                    )
+                    .map_err(Stop::Normalization)?
+                    {
+                        return Ok(());
+                    }
+                }
+                match witness(work, super::kernel::witness_probe_fits(work.budget))? {
+                    super::kernel::Witness::Different => {
+                        return Err(Stop::Judgment(Negative::TypeMismatch));
+                    }
+                    super::kernel::Witness::Deferred => {
+                        *deferred = true;
+                        work.begin_witness_probe();
+                    }
+                    super::kernel::Witness::Inconclusive => {}
+                }
+                ordinary(work)
+            })();
+            #[cfg(feature = "introspection")]
+            if let Err(stop) = result {
+                capture_ordinary(work, request, stop, request.ty, request.value, None);
+            }
+            result
+        };
+        let fallback = |work: &mut Working<'_>| {
+            let result = (|| {
+                if witness(work, false)? == super::kernel::Witness::Different {
+                    return Err(Stop::Judgment(Negative::TypeMismatch));
+                }
+                ordinary(work)
+            })();
+            #[cfg(feature = "introspection")]
+            if let Err(stop) = result {
+                capture_ordinary(work, request, stop, request.ty, request.value, None);
+            }
+            result
+        };
+        let formation_negative = decoder
+            .declaration_with_deferred_witness(budget, fast, fallback)
             .map_err(|error| error.failure_report())?;
         // A captured negative is usable only after all session cleanup succeeds.
         // It never installs this declaration or enables further semantic checking.

@@ -37,6 +37,9 @@
 //! parameters equal derivation's by typing.
 use super::*;
 
+mod enum_handler;
+use enum_handler::EnumHandler;
+
 /// Fresh unfoldings of one constant in an attempt before it is derived.
 const HOT: u32 = 32;
 /// Derivations one attempt may run, successful or not.
@@ -87,10 +90,14 @@ enum Slot {
 enum Leaf {
     Value(Slot),
     Call([u8; MAX_SPLITS]),
+    /// Preserve the matched constructor prefix and recurse under its last field.
+    RebuildLast,
     /// Index into the template store, little-endian in three bytes so a
     /// leaf stays byte-aligned and a whole rule fits in 32 bytes.
     Template([u8; 3]),
     Projection([u8; 3]),
+    /// Checked handler selection alongside the original fallback template.
+    EnumHandler([u8; 3]),
 }
 /// A recorded residual: `len` nodes from `nodes` in the node store, spine
 /// items counted from `items` in the item store; `root` is the result.
@@ -111,6 +118,8 @@ enum TRef {
 /// One template node; children precede their parents.
 #[derive(Clone, Copy)]
 enum TNode {
+    /// Trailing instruction for an enum-handler leaf, after its fallback nodes.
+    EnumHandler(EnumHandler),
     /// A pattern variable.
     Slot(Slot),
     /// The argument guard `g` matched, as the call passed it.
@@ -391,11 +400,44 @@ impl Kernel<'_, '_> {
                     let v = self.push(Val::Proj { x, idx, sci })?;
                     return Ok(Some(self.apply_extra(v, &extra[..ne])?));
                 }
-                Leaf::Template([a, b, c]) => {
+                Leaf::EnumHandler(packed) | Leaf::Template(packed) => {
+                    let [a, b, c] = packed;
                     let at = u32::from_le_bytes([a, b, c, 0]);
                     let tp = self.derived.templates[at as usize];
-                    let v = self.instantiate_template(tp, &rule, &args, &heads)?;
+                    let v = if matches!(rule.leaf, Leaf::EnumHandler(_))
+                        && let Some(v) = self.apply_enum_handler(tp, &rule, &args, heads[0].1)?
+                    {
+                        v
+                    } else {
+                        self.instantiate_template(tp, &rule, &args, &heads)?
+                    };
                     return Ok(Some(self.apply_extra(v, &extra[..ne])?));
+                }
+                Leaf::RebuildLast => {
+                    let j = rule.guards[0].arg as usize;
+                    // Guard matching also understands Nat and String literals.
+                    // Only an ordinary constructor supplies a reusable prefix.
+                    if !matches!(heads[0].1, Head::Ctor { .. }) {
+                        break;
+                    }
+                    let original = self.materialize(args[j])?;
+                    let root = self.whnf(original)?;
+                    let Some((ctor, cli, last)) = self.rebuild_prefix(root) else {
+                        break;
+                    };
+                    args[j] = u64::from(last.item);
+                    let mut next = [0; MAX_ARITY];
+                    for k in 0..n {
+                        next[k] = self.materialize(args[k])?;
+                    }
+                    let tail = self.call(ci, li, &next[..n])?;
+                    let spine = self.cell(last.prev, tail, 0)?;
+                    let out = self.push(Val::Const {
+                        ci: ctor,
+                        li: cli,
+                        spine,
+                    })?;
+                    return Ok(Some(self.apply_extra(out, &extra[..ne])?));
                 }
                 Leaf::Call(fields) => {
                     // Fields come from the heads of the old arguments, so the
@@ -451,6 +493,7 @@ impl Kernel<'_, '_> {
                     TRef::Node(j) => out[j as usize],
                 };
                 let v = match node {
+                    TNode::EnumHandler(_) => return Err(ResourceError::Invariant.into()),
                     TNode::Slot(Slot::Arg(j)) => self.materialize(args[j as usize])?,
                     TNode::Slot(Slot::Field(g, f)) => {
                         let a = self.field(rule.guards[g as usize], heads[g as usize].1, f)?;
@@ -893,6 +936,20 @@ impl Kernel<'_, '_> {
                 rules.push(rule(Leaf::Call(fields)));
                 return Ok(());
             }
+            if depth == 1 {
+                let j = splits[0].guard.arg as usize;
+                // Preserve a data field as well as the recursive field.
+                // Unary constructor arithmetic benefits from sharing the
+                // original recursor instead of rebuilding a fresh call.
+                if fields[0] != 0
+                    && fields[0] + 1 == splits[0].guard.nfields
+                    && self.can_rebuild_last(xs[j], next[j], args[j], r, r2)?
+                {
+                    spare(rules, 1)?;
+                    rules.push(rule(Leaf::RebuildLast));
+                    return Ok(());
+                }
+            }
         }
         // Template leaf: the residual itself. Under a natural
         // number guard only an application of a pattern variable to pattern
@@ -929,11 +986,98 @@ impl Kernel<'_, '_> {
             let packed = [a, b, c];
             rules.push(rule(if direct_projection {
                 Leaf::Projection(packed)
+            } else if depth == 1
+                && !apps_only
+                && let Some(op) =
+                    self.enum_handler(t, &splits[0], args[splits[0].guard.arg as usize])?
+            {
+                room(self.b, &mut self.reserved, &mut self.derived.tnodes, 1)?;
+                self.derived.tnodes.push(TNode::EnumHandler(op));
+                Leaf::EnumHandler(packed)
             } else {
                 Leaf::Template(packed)
             }));
         }
         Ok(())
+    }
+
+    /// A literal can match a constructor guard after virtual expansion. A
+    /// projection cell stores a structure identifier in place of a field.
+    /// Neither representation supplies an ordinary recursive field here.
+    fn rebuild_prefix(&self, root: u32) -> Option<(u32, u32, Cell)> {
+        let Val::Const { ci, li, spine } = self.vals[root as usize] else {
+            return None;
+        };
+        if spine == 0 || self.proj_prefix(spine).is_some() {
+            return None;
+        }
+        Some((ci, li, self.cells[spine as usize]))
+    }
+
+    /// The result preserves the matched constructor's prefix and its final
+    /// field has the same reduct as the recursive call. Both the whole
+    /// argument and the recursive field must have the same type under this
+    /// branch's fresh locals. Success is preserved by substitution.
+    fn can_rebuild_last(
+        &mut self,
+        whole: u32,
+        tail: u32,
+        matched: u32,
+        result: u32,
+        recursive: u32,
+    ) -> R<bool> {
+        let Val::Local {
+            id: whole,
+            spine: 0,
+        } = self.vals[whole as usize]
+        else {
+            return Ok(false);
+        };
+        let Val::Local { id: tail, spine: 0 } = self.vals[tail as usize] else {
+            return Ok(false);
+        };
+        let Val::Const { ci, li, spine } = self.vals[matched as usize] else {
+            return Ok(false);
+        };
+        let Val::Const {
+            ci: out_ci,
+            li: out_li,
+            spine: out_spine,
+        } = self.vals[result as usize]
+        else {
+            return Ok(false);
+        };
+        if ci != out_ci
+            || spine == 0
+            || out_spine == 0
+            || !self.same_levels(li, out_li)?
+            || !self.same(self.locals[whole as usize], self.locals[tail as usize])?
+        {
+            return Ok(false);
+        }
+        let input = self.cells[spine as usize];
+        let output = self.cells[out_spine as usize];
+        if input.tag != 0 || output.tag != 0 {
+            return Ok(false);
+        }
+        if input.prev != output.prev {
+            // Constructor and levels already agree, compare just the prefixes.
+            let a = self.push(Val::Const {
+                ci,
+                li,
+                spine: input.prev,
+            })?;
+            let b = self.push(Val::Const {
+                ci,
+                li,
+                spine: output.prev,
+            })?;
+            if !self.same(a, b)? {
+                return Ok(false);
+            }
+        }
+        let observed = self.whnf(output.item)?;
+        Ok(!self.derived.native && self.same(observed, recursive)?)
     }
 
     /// Record `r` as a template over this path's pattern variables and store
@@ -1470,13 +1614,39 @@ impl Kernel<'_, '_> {
                     let major = items[major_at];
                     self.recycle(items)?;
                     let m = self.whnf(major)?;
-                    return Ok((0..args.len()).find(|&i| open >> i & 1 == 1 && args[i] == m));
+                    let candidate = self.blocking_argument(m, args, open);
+                    if let Some(i) = candidate
+                        && args[i] != m
+                        && (rec.rules.len() > MAX_CTORS
+                            || rec.rules.iter().any(|r| r.num_fields != 0))
+                    {
+                        return Ok(None);
+                    }
+                    return Ok(candidate);
                 }
                 Val::Proj { x, .. } => r = self.whnf(x)?,
                 _ => return Ok(None),
             }
         }
         Ok(None)
+    }
+
+    /// Open arguments are the original bare pattern locals. To observe one
+    /// projected field the recursor must expose its source; specializing that
+    /// source still uses the ordinary checked constructor guard and residual.
+    fn blocking_argument(&self, major: u32, args: &[u32], open: u64) -> Option<usize> {
+        let projected = match self.vals[major as usize] {
+            Val::Local { id, spine } if spine != 0 => {
+                let cell = self.cells[spine as usize];
+                (cell.prev == 0 && cell.tag != 0).then_some(id)
+            }
+            _ => None,
+        };
+        (0..args.len()).find(|&i| {
+            open >> i & 1 != 0
+                && (args[i] == major
+                    || matches!(self.vals[args[i] as usize], Val::Local { id, spine: 0 } if Some(id) == projected))
+        })
     }
 
     /// The pattern variable `r` is, if any.

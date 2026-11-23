@@ -1,6 +1,35 @@
 //! A concrete instance of a checked theorem type mismatch.
 use super::*;
 
+const CONSTRUCTOR_DEPTH: u8 = 4;
+const STRING_CONSTRUCTOR_DEPTH: u8 = 12;
+const STRING_WITNESS_MAX_BYTES: usize = 64;
+
+const NATURAL_OBSERVATION_STEPS: u64 = 1 << 16;
+
+/// Leave headroom for both a dispatcher-bounded ordinary trial and the full
+/// value witness. Actual work and storage are always charged by their owners.
+pub(in crate::check::environment) fn witness_probe_fits(budget: &Budget) -> bool {
+    budget.has_work_headroom(2 * MAX_STEPS)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::check::environment) enum Witness {
+    Different,
+    Inconclusive,
+    Deferred,
+}
+
+const SYMBOLIC_STEPS: u64 = 1 << 23;
+
+struct Schedule {
+    // None denotes the ordinary concrete schedule. NONE is replaced by the
+    // exact local handle only when the second checked Nat binder is opened.
+    symbolic: Option<u32>,
+    bound_naturals: bool,
+    deferred: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Application {
     ci: u32,
@@ -37,6 +66,8 @@ impl Kernel<'_, '_> {
         b: Application,
         skip: usize,
         depth: u8,
+        expand_literals: bool,
+        schedule: &mut Schedule,
     ) -> R<bool> {
         if a.ci != b.ci || a.len != b.len || !self.same_levels(a.li, b.li)? {
             return Ok(false);
@@ -53,7 +84,16 @@ impl Kernel<'_, '_> {
             if i >= skip && a.args[i] != b.args[i] {
                 let (da, db) = (self.binder_dom(pa)?, self.binder_dom(pb)?);
                 if self.visibly_distinct(a.args[i], b.args[i])? {
-                    if self.defeq(da, db)? && self.witness_data(a.args[i], b.args[i], da, depth)? {
+                    if self.defeq(da, db)?
+                        && self.witness_data(
+                            a.args[i],
+                            b.args[i],
+                            da,
+                            depth,
+                            expand_literals,
+                            schedule,
+                        )?
+                    {
                         return Ok(true);
                     }
                 } else {
@@ -66,7 +106,7 @@ impl Kernel<'_, '_> {
         for (i, domains) in deferred[..a.len].iter().enumerate() {
             if let Some((da, db)) = *domains
                 && self.defeq(da, db)?
-                && self.witness_data(a.args[i], b.args[i], da, depth)?
+                && self.witness_data(a.args[i], b.args[i], da, depth, expand_literals, schedule)?
             {
                 return Ok(true);
             }
@@ -74,7 +114,15 @@ impl Kernel<'_, '_> {
         Ok(false)
     }
 
-    fn witness_data(&mut self, a: u32, b: u32, ty: u32, depth: u8) -> R<bool> {
+    fn witness_data(
+        &mut self,
+        a: u32,
+        b: u32,
+        ty: u32,
+        depth: u8,
+        expand_literals: bool,
+        schedule: &mut Schedule,
+    ) -> R<bool> {
         if depth == 0 || a == b {
             return Ok(false);
         }
@@ -95,7 +143,52 @@ impl Kernel<'_, '_> {
         let Some(ind) = info.ind else {
             return Ok(false);
         };
-        let (a, b) = (self.whnf(a)?, self.whnf(b)?);
+        if let Some(fresh) = schedule.symbolic {
+            return if fresh == NONE {
+                Ok(false)
+            } else {
+                self.symbolic_bool_difference(a, b, info.canon, fresh)
+            };
+        }
+        let observe = |k: &mut Self| Ok((k.whnf(a)?, k.whnf(b)?));
+        let (mut a, mut b) = if schedule.bound_naturals
+            && self.nat_ctors()?.is_some_and(|(nat, _, _)| nat == family)
+        {
+            let saved = self.bounds;
+            self.limit_total(self.steps.saturating_add(NATURAL_OBSERVATION_STEPS));
+            let result = observe(self);
+            self.restore_bounds(saved);
+            if matches!(result, Err(KErr::Abort)) && self.steps <= self.limit {
+                schedule.deferred = true;
+            }
+            result?
+        } else {
+            observe(self)?
+        };
+        let mut expanded = false;
+        if expand_literals {
+            for value in [&mut a, &mut b] {
+                if let Val::Str(literal) = self.vals[*value as usize] {
+                    let ExprKind::String(bytes) =
+                        self.exprs
+                            .get(literal, self.b)?
+                            .kind(self.exprs, self.levels, self.b)?
+                    else {
+                        return Err(ResourceError::Invariant.into());
+                    };
+                    if bytes.len() > STRING_WITNESS_MAX_BYTES {
+                        return Ok(false);
+                    }
+                    // The operands were independently checked at the common
+                    // data type. Expansion computes the same String via the
+                    // committed interpretation. It supplies no negative by
+                    // itself, even when only the typed interface is available.
+                    let v = self.expand_str(literal)?;
+                    *value = self.whnf(v)?;
+                    expanded = true;
+                }
+            }
+        }
         if let (Val::Nat(x), Val::Nat(y)) = (self.vals[a as usize], self.vals[b as usize]) {
             let nat = self.nat_type()?;
             if !self.defeq(ty, nat)? {
@@ -134,12 +227,42 @@ impl Kernel<'_, '_> {
         if a.ci != b.ci {
             return Ok(true);
         }
-        self.witness_arguments(a, b, ind.nparams as usize, depth - 1)
+        // Spend the additional depth only once along each path. Ordinary
+        // constructor and proof-field guards still decide every child.
+        let depth = if expanded {
+            STRING_CONSTRUCTOR_DEPTH
+        } else {
+            depth
+        };
+        self.witness_arguments(
+            a,
+            b,
+            ind.nparams as usize,
+            depth - 1,
+            expand_literals && !expanded,
+            schedule,
+        )
     }
 
-    fn concrete_argument(&mut self, ty: u32, index: usize) -> R<u32> {
+    fn witness_argument(&mut self, ty: u32, index: usize, schedule: &mut Schedule) -> R<u32> {
         let nat = self.nat_type()?;
         if self.defeq(ty, nat)? {
+            if schedule.symbolic.is_some() {
+                if index == 0 {
+                    return self.nat(NatLit::Small(0));
+                }
+                let (_, _, succ) = self.nat_ctors()?.ok_or(KErr::Unsupported)?;
+                // This is a new arbitrary Nat in the extended context, not a
+                // reusable binder position from the earlier inference pass.
+                let local = self.fresh_local(nat)?;
+                schedule.symbolic = Some(local);
+                let f = self.push(Val::Const {
+                    ci: succ,
+                    li: 0,
+                    spine: 0,
+                })?;
+                return self.apply(f, local);
+            }
             if index == 0 {
                 return self.nat(NatLit::Small(1));
             }
@@ -160,6 +283,9 @@ impl Kernel<'_, '_> {
             )?;
             return self.nat(value);
         }
+        if schedule.symbolic.is_some() {
+            return no();
+        }
         let Some(name) = self.env.checked_le_name() else {
             return no();
         };
@@ -178,7 +304,7 @@ impl Kernel<'_, '_> {
         })
     }
 
-    fn theorem_witness(&mut self, request: &Request<'_>) -> R<bool> {
+    fn theorem_witness(&mut self, request: &Request<'_>, schedule: &mut Schedule) -> R<bool> {
         let sort = self.infer(request.ty, 0, 0, true)?;
         let level = self.sort_of(sort)?;
         if !self.is_zero(level)? {
@@ -199,7 +325,7 @@ impl Kernel<'_, '_> {
                 if a.len != ind.nparams as usize + ind.nidx as usize {
                     return Ok(false);
                 }
-                return self.witness_arguments(a, b, 0, 4);
+                return self.witness_arguments(a, b, 0, CONSTRUCTOR_DEPTH, true, schedule);
             }
             if index == 2 {
                 return Ok(false);
@@ -209,7 +335,7 @@ impl Kernel<'_, '_> {
             if !self.defeq(da, db)? {
                 return Ok(false);
             }
-            let arg = self.concrete_argument(da, index)?;
+            let arg = self.witness_argument(da, index, schedule)?;
             actual = self.instantiate(a, arg)?;
             expected = self.instantiate(b, arg)?;
         }
@@ -226,10 +352,11 @@ pub(in crate::check::environment) fn different(
     exprs: &Expressions,
     levels: &mut Levels,
     budget: &mut Budget,
-) -> Result<bool, super::super::normalization::HeadError> {
+    bound_naturals: bool,
+) -> Result<Witness, super::super::normalization::HeadError> {
     if request.kind != Kind::Theorem || !request.parameters.is_empty() || !eligible(request, scope)
     {
-        return Ok(false);
+        return Ok(Witness::Inconclusive);
     }
     environment.check_scope(
         scope.before,
@@ -237,20 +364,95 @@ pub(in crate::check::environment) fn different(
         scope.expression_end,
         scope.level_end,
     )?;
+    // The fast positive checker has already tried these roots. Double Pi
+    // syntax is only an admission hint. Both domains are checked again.
+    if bound_naturals
+        && budget.has_work_headroom(2 * MAX_STEPS + SYMBOLIC_STEPS)
+        && let ExprKind::Pi(_, _, body, _) =
+            exprs.get(request.ty, budget)?.kind(exprs, levels, budget)?
+        && matches!(
+            exprs.get(body, budget)?.kind(exprs, levels, budget)?,
+            ExprKind::Pi(..)
+        )
+        && attempt(
+            environment,
+            request,
+            scope,
+            names,
+            exprs,
+            levels,
+            budget,
+            false,
+            true,
+        )? == Witness::Different
+    {
+        return Ok(Witness::Different);
+    }
+    attempt(
+        environment,
+        request,
+        scope,
+        names,
+        exprs,
+        levels,
+        budget,
+        bound_naturals,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    environment: &Environment,
+    request: &Request<'_>,
+    scope: &Scope<'_>,
+    names: &Names,
+    exprs: &Expressions,
+    levels: &mut Levels,
+    budget: &mut Budget,
+    bound_naturals: bool,
+    symbolic: bool,
+) -> Result<Witness, super::super::normalization::HeadError> {
     let mut k = Kernel::new(environment, names, exprs, levels, budget, scope);
-    let result = k.init().and_then(|()| k.theorem_witness(request));
+    let mut schedule = Schedule {
+        symbolic: symbolic.then_some(NONE),
+        bound_naturals,
+        deferred: false,
+    };
+    let result = k.init().and_then(|()| {
+        if symbolic {
+            k.limit_total(SYMBOLIC_STEPS);
+        }
+        k.theorem_witness(request, &mut schedule)
+    });
     let steps = k.steps - k.charged;
     let reserved = k.reserved;
     k.retire_arena();
     drop(k);
     let charge = budget.charge_work(steps);
     let release = budget.release(reserved);
-    let (complete, _) = finish_attempt(
-        result.as_ref().map(|_| ()).map_err(|e| *e),
-        charge,
-        release,
-        false,
-    )?;
+    let complete = finish_witness_attempt(symbolic, result, charge, release)?;
     let different = complete && matches!(result, Ok(true));
-    Ok(different)
+    Ok(if different {
+        Witness::Different
+    } else if schedule.deferred {
+        Witness::Deferred
+    } else {
+        Witness::Inconclusive
+    })
+}
+
+/// Arithmetic unsupported only on the optional substitution is a local miss.
+/// Mandatory work, storage and retirement failures still veto any result.
+fn finish_witness_attempt(
+    symbolic: bool,
+    result: R<bool>,
+    charge: Result<(), ResourceError>,
+    release: Result<(), ResourceError>,
+) -> Result<bool, super::super::normalization::HeadError> {
+    let status = match (symbolic, result) {
+        (true, Err(KErr::LiteralArithmetic)) => Err(KErr::Unsupported),
+        (_, result) => result.map(|_| ()),
+    };
+    finish_attempt(status, charge, release, false).map(|(complete, _)| complete)
 }

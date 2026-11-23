@@ -3,16 +3,12 @@ use super::*;
 use crate::syntax::levels::LevelNames;
 pub(super) mod primitive;
 
-pub(super) enum Pair {
-    Zero,
-    Successors(ExprId, ExprId),
-    Unavailable,
-}
+use super::literal::Pair;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn classify(
-    left: ExprId,
-    right: ExprId,
+pub(super) fn classify_paired(
+    a: ExprKind<'_>,
+    b: ExprKind<'_>,
     scope: &Scope<'_>,
     environment: &Environment,
     expressions: &Expressions,
@@ -20,12 +16,6 @@ pub(super) fn classify(
     names: &Names,
     budget: &mut Budget,
 ) -> Result<Pair, HeadError> {
-    let a = expressions
-        .get(left, budget)?
-        .kind(expressions, levels, budget)?;
-    let b = expressions
-        .get(right, budget)?
-        .kind(expressions, levels, budget)?;
     enum Shape {
         Zero(crate::syntax::levels::NameId),
         Successors(
@@ -88,10 +78,9 @@ pub(super) fn classify(
     })
 }
 
-/// Paired-loop predecessor rule on checked operands in this exact session.
-/// Only one literal layer is materialized, after committed Nat authority is found.
+/// Materialize one literal layer for a checked, certified Nat successor pair.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paired(
+pub(super) fn paired_predecessors(
     left: ExprId,
     right: ExprId,
     scope: &Scope<'_>,
@@ -101,19 +90,6 @@ pub(super) fn paired(
     names: &Names,
     budget: &mut Budget,
 ) -> Result<Pair, HeadError> {
-    let classified = classify(
-        left,
-        right,
-        scope,
-        environment,
-        expressions,
-        levels,
-        names,
-        budget,
-    )?;
-    if !matches!(classified, Pair::Unavailable) {
-        return Ok(classified);
-    }
     let a = expressions
         .get(left, budget)?
         .kind(expressions, levels, budget)?;
@@ -199,16 +175,7 @@ pub(super) fn zero_identity(
         return Ok(false);
     }
     Ok(matches!(
-        classify(
-            left,
-            right,
-            scope,
-            environment,
-            expressions,
-            levels,
-            names,
-            budget
-        )?,
+        classify_paired(a, b, scope, environment, expressions, levels, names, budget)?,
         Pair::Zero
     ))
 }

@@ -5,6 +5,7 @@
 //! no handle or completed cache entry escapes declaration retirement.
 mod constructor;
 mod delta;
+mod literal;
 mod natural;
 mod projection;
 mod quotient;
@@ -14,6 +15,7 @@ mod spine;
 use super::{Normal, Scope, cache, machine, positive, select_failure};
 use crate::check::environment::CheckednessMint;
 use crate::check::environment::Environment;
+use crate::check::environment::normalization::string;
 use crate::check::environment::normalization::{Head, HeadError, TypeObservation};
 use crate::resource::{Budget, ReductionPath, ResourceError, SessionCacheBudget};
 use crate::syntax::expressions::{ExprId, ExprKind, Expressions, binding::Binding};
@@ -93,6 +95,7 @@ enum Phase {
     ProofCompare,
     ProofDone,
     NaturalPredecessors,
+    StringCompare,
     Paired,
     Arithmetic,
     PairedUnfold,
@@ -509,7 +512,7 @@ impl Machine {
                 self.phase = Phase::Prefix;
             }
             if self.phase == Phase::Paired {
-                match natural::paired(
+                match literal::paired(
                     self.left,
                     self.right,
                     scope,
@@ -519,10 +522,10 @@ impl Machine {
                     names,
                     budget,
                 )? {
-                    natural::Pair::Zero => {
+                    literal::Pair::Zero => {
                         return self.finish(Decision::Equal(self.incoming), locals, ledger, budget);
                     }
-                    natural::Pair::Successors(left, right) => {
+                    literal::Pair::Successors(left, right) => {
                         self.phase = Phase::NaturalPredecessors;
                         self.waiting = true;
                         return Ok(Demand::Comparison {
@@ -531,7 +534,36 @@ impl Machine {
                             incoming: self.incoming,
                         });
                     }
-                    natural::Pair::Unavailable => (),
+                    literal::Pair::StringLiteral { left, function } => {
+                        let literal = if left { self.left } else { self.right };
+                        if let Some(expanded) = string::expand_matching_of_list(
+                            literal,
+                            function,
+                            self.incoming,
+                            *scope,
+                            environment,
+                            expressions,
+                            levels,
+                            names,
+                            budget,
+                        )? {
+                            // Certified expansion preserves the checked literal's
+                            // denotation. Only the ordinary child can supply a result.
+                            self.incoming = expanded.path;
+                            self.phase = Phase::StringCompare;
+                            self.waiting = true;
+                            return Ok(Demand::Comparison {
+                                left: if left { expanded.expression } else { self.left },
+                                right: if left {
+                                    self.right
+                                } else {
+                                    expanded.expression
+                                },
+                                incoming: expanded.path,
+                            });
+                        }
+                    }
+                    literal::Pair::Unavailable => (),
                 }
                 self.delta_sides = delta::select(
                     self.left,
@@ -2188,6 +2220,7 @@ impl Machine {
                     | Phase::LocalPrefix
                     | Phase::SameDefinition
                     | Phase::NaturalPredecessors
+                    | Phase::StringCompare
                     | Phase::ProofCompare
                     | Phase::Arguments
                     | Phase::PositiveArguments

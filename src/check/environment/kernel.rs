@@ -41,7 +41,7 @@ use std::num::NonZeroU32;
 
 mod declaration_witness;
 mod derived;
-pub(super) use declaration_witness::different as different_theorem;
+pub(super) use declaration_witness::{Witness, different as different_theorem, witness_probe_fits};
 pub(super) mod negative;
 mod read_large;
 mod retention;
@@ -749,6 +749,8 @@ const LOSSY_REVIEW: u64 = 1 << 14;
 const SYN_BUDGET: u64 = 64;
 /// Amortize optional context analysis only after an attempt has done real work.
 const ALPHA_MIN_STEPS: u64 = 4096;
+/// Short staged formation checks often visit a wide telescope only once.
+const FORMATION_CONTEXT_KEY_MIN_STEPS: u64 = 1 << 20;
 /// Local ids at and above this are syntactic-comparison placeholders.
 const MARKER_BASE: u32 = 0xF000_0000;
 
@@ -4403,23 +4405,20 @@ impl<'e, 'w> Kernel<'e, 'w> {
         node: Expression<'w>,
         key: (u32, u32, u32),
     ) -> R<u32> {
-        // At most eight free slots cannot form a large key; an index above
-        // 255 makes the complete mask unknown. Skip only impossible keys,
-        // avoiding preparation work/charges that we no longer perform.
-        let large_key = if self.steps >= ALPHA_MIN_STEPS
-            && node.depth() != 0
-            && (9..=256).contains(&node.loose_range())
-        {
-            self.large_type_key(e, env, li, check)?
-        } else {
-            None
-        };
+        let key_admitted = self.steps >= ALPHA_MIN_STEPS
+            && (self.formation.is_none() || self.steps >= FORMATION_CONTEXT_KEY_MIN_STEPS);
+        let large_key =
+            if key_admitted && node.depth() != 0 && (9..=256).contains(&node.loose_range()) {
+                self.large_type_key(e, env, li, check)?
+            } else {
+                None
+            };
         if let Some(ref k) = large_key
             && let Some(&t) = self.large_read_types.get(k)
         {
             return Ok(t);
         }
-        let alpha = if check && self.steps >= ALPHA_MIN_STEPS && node.depth() != 0 {
+        let alpha = if check && key_admitted && node.depth() != 0 {
             self.alpha_key(e, env, li, node.loose_range())?
         } else {
             None
@@ -4684,6 +4683,100 @@ impl<'e, 'w> Kernel<'e, 'w> {
             _ => no(),
         }
     }
+    /// A checked constructor domain headed by a fully applied inductive with
+    /// literal result sort Prop is a proposition for every term and universe
+    /// substitution. The one positive entry lives only for this telescope walk.
+    fn raw_prop_field(&mut self, mut head: ExprId, last: &mut Option<(ExprId, u32)>) -> R<bool> {
+        let mut arity = 0;
+        let (name, universes) = loop {
+            self.step()?;
+            if *last == Some((head, arity)) {
+                return Ok(true);
+            }
+            match self
+                .exprs
+                .get(head, self.b)?
+                .kind(self.exprs, self.levels, self.b)?
+            {
+                ExprKind::App(f, _) if arity < SMALL_SPINE as u32 => {
+                    arity += 1;
+                    head = f;
+                }
+                ExprKind::Constant(n, us) => break (n, us.len()),
+                _ => return Ok(false),
+            }
+        };
+        let ci = match self.const_info(name) {
+            Ok(ci) => ci,
+            Err(KErr::Unsupported) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let info = *self.const_view(ci)?;
+        let (Some(ind), Some(mut ty)) = (info.ind, info.ty) else {
+            return Ok(false);
+        };
+        if info.params.len() != universes || ind.nparams.checked_add(ind.nidx) != Some(arity) {
+            return Ok(false);
+        }
+        for _ in 0..arity {
+            self.step()?;
+            let ExprKind::Pi(_, _, body, _) =
+                self.exprs
+                    .get(ty, self.b)?
+                    .kind(self.exprs, self.levels, self.b)?
+            else {
+                return Ok(false);
+            };
+            ty = body;
+        }
+        let proven = matches!(self.exprs.get(ty, self.b)?.kind(self.exprs, self.levels, self.b)?, ExprKind::Sort(level) if level == LevelId::ZERO);
+        if proven {
+            *last = Some((head, arity));
+        }
+        Ok(proven)
+    }
+
+    /// Every consumed field has separately passed the Prop guard. Extend the
+    /// actual constructor closure with the projection of the same scrutinee;
+    /// reductions in a dependent field can subsequently force this value.
+    fn proof_field_prefix(&mut self, t: u32, xv: u32, sci: u32, selected: u32) -> R<(u32, u32)> {
+        let binder = self.pi_like(t)?;
+        let Val::Pi(mut c) = self.vals[binder as usize] else {
+            return Ok((0, binder));
+        };
+        let mut last = None;
+        let mut skipped = 0;
+        while skipped < selected {
+            let ExprKind::Pi(_, dom, body, _) =
+                self.exprs
+                    .get(c.body, self.b)?
+                    .kind(self.exprs, self.levels, self.b)?
+            else {
+                break;
+            };
+            if !self.raw_prop_field(c.dom, &mut last)? {
+                break;
+            }
+            let field = self.push(Val::Proj {
+                x: xv,
+                idx: skipped,
+                sci,
+            })?;
+            c = Clo {
+                dom,
+                body,
+                env: self.env_push(c.env, field, NONE)?,
+                li: c.li,
+            };
+            skipped += 1;
+        }
+        if skipped == 0 {
+            Ok((0, binder))
+        } else {
+            Ok((skipped, self.push(Val::Pi(c))?))
+        }
+    }
+
     fn proj_type(&mut self, xv: u32, xt: u32, idx: u32, sci: u32, check: bool) -> R<u32> {
         let w = self.whnf(xt)?;
         let Val::Const { ci, li, spine } = self.vals[w as usize] else {
@@ -4722,7 +4815,13 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 let pw = self.pi_like(t)?;
                 t = self.instantiate(pw, p)?;
             }
-            for j in 0..idx {
+            let mut start = 0;
+            // The source certificate is the installed constructor declaration.
+            // Keep all staged checking on its original semantic path.
+            if check && prop && idx >= 4 && self.formation.is_none() {
+                (start, t) = self.proof_field_prefix(t, xv, sci, idx)?;
+            }
+            for j in start..idx {
                 let pw = self.pi_like(t)?;
                 if check && prop {
                     let fd = self.binder_dom(pw)?;

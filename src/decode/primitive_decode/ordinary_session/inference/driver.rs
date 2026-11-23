@@ -563,6 +563,9 @@ pub(super) fn run(
     // It determines cleanup's frame releases and diagnostic ancestor bound only.
     let mut active_retired = false;
     let result = (|| loop {
+        if work.budget.snapshot().work_charged >= work.probe_deadline {
+            return Err(Stop::ProbeYield);
+        }
         let request = match &descendants
             .last()
             .or(root.as_ref())

@@ -259,6 +259,14 @@ pub(crate) fn select_failure<const N: usize>(errors: [Option<HeadError>; N]) -> 
         .into_iter()
         .flatten()
         .find(internal)
+        // A locally unsupported operation may be retried. Its retirement
+        // error must remain visible to that owner.
+        .or_else(|| {
+            errors
+                .into_iter()
+                .flatten()
+                .find(|error| *error != HeadError::Unsupported)
+        })
         .or_else(|| errors.into_iter().flatten().next())
 }
 

@@ -1012,6 +1012,12 @@ pub(super) fn select_failure<const N: usize>(errors: [Option<Stop>; N]) -> Optio
         .flatten()
         .find(|error| error.report().outcome == FailureOutcome::InternalError)
         .or_else(|| {
+            errors.into_iter().flatten().find(|error| {
+                !matches!(error, Stop::Judgment(_) | Stop::ProbeYield)
+                    && !super::driver::locally_unsupported(*error)
+            })
+        })
+        .or_else(|| {
             errors
                 .into_iter()
                 .flatten()
