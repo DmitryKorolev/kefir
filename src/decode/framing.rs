@@ -83,6 +83,54 @@ impl<'a, R: Read> Framer<'a, R> {
             }
         }
     }
+    /// A tentative match cannot inspect beyond the current chunk or record cap.
+    pub(crate) fn window(&self) -> &[u8] {
+        &self.chunk[self.pos..self.end.min(self.pos.saturating_add(self.record_limit))]
+    }
+
+    /// Called only after a complete LF-terminated record matched in window().
+    /// Preserve admission and the original record-buffer allocation failure point.
+    pub(crate) fn admit_line(&mut self, take: usize, b: &mut Budget) -> Result<&[u8], FrameError> {
+        self.record.clear();
+        let start = self.pos;
+        self.admit_span(take, self.record_limit, b)?;
+        Ok(&self.chunk[start..self.pos - 1])
+    }
+
+    #[inline]
+    fn admit_span(
+        &mut self,
+        take: usize,
+        remaining: usize,
+        b: &mut Budget,
+    ) -> Result<(), FrameError> {
+        if crate::resource::traced!("framing.limit", (take, remaining), { take > remaining }) {
+            self.pos += remaining;
+            self.admitted = self
+                .admitted
+                .checked_add(remaining as u64)
+                .ok_or(ResourceError::Counter)?;
+            b.admitted_input(self.admitted);
+            return Err(ResourceError::RecordBytes.into());
+        }
+        let required = self
+            .record
+            .len()
+            .checked_add(take)
+            .ok_or(ResourceError::Counter)?;
+        // This in-cap span was inspected by framing, unlike untouched
+        // read-ahead. Account it even if allocating its retained copy fails.
+
+        self.admitted = self
+            .admitted
+            .checked_add(take as u64)
+            .ok_or(ResourceError::Counter)?;
+        b.admitted_input(self.admitted);
+        self.pos += take;
+        b.grow_vec(&mut self.record, required)?;
+        Ok(())
+    }
+
     fn advance(&mut self, b: &mut Budget) -> Result<Option<Frame>, FrameError> {
         self.record.clear();
         loop {
@@ -101,36 +149,14 @@ impl<'a, R: Read> Framer<'a, R> {
             // or counter updates; at most one byte beyond the record cap is read.
             let newline = find_newline(bytes);
             let take = newline.map_or(scan, |i| i + 1);
-            if crate::resource::traced!("framing.limit", (take, remaining), { take > remaining }) {
-                self.pos += remaining;
-                self.admitted = self
-                    .admitted
-                    .checked_add(remaining as u64)
-                    .ok_or(ResourceError::Counter)?;
-                b.admitted_input(self.admitted);
-                return Err(ResourceError::RecordBytes.into());
-            }
-            let required = self
-                .record
-                .len()
-                .checked_add(take)
-                .ok_or(ResourceError::Counter)?;
-            // This in-cap span was inspected by framing, unlike untouched
-            // read-ahead. Account it even if allocating its retained copy fails.
             let start = self.pos;
-            self.admitted = self
-                .admitted
-                .checked_add(take as u64)
-                .ok_or(ResourceError::Counter)?;
-            b.admitted_input(self.admitted);
-            self.pos += take;
+            self.admit_span(take, remaining, b)?;
 
             if self.record.is_empty() && (newline.is_some() || self.eof) {
                 // Preserve the old record-buffer reservation and allocator-failure
                 // point even though this record is returned directly from `chunk`.
                 // The budget therefore observes the same growth/charge sequence;
                 // only the redundant byte copy is removed.
-                b.grow_vec(&mut self.record, required)?;
                 let mut len = take - usize::from(newline.is_some());
                 if newline.is_some() && len > 0 && self.chunk[start + len - 1] == b'\r' {
                     len -= 1;
@@ -138,7 +164,6 @@ impl<'a, R: Read> Framer<'a, R> {
                 return Ok(Some(Frame::Chunk { start, len }));
             }
 
-            b.grow_vec(&mut self.record, required)?;
             self.record.extend_from_slice(&self.chunk[start..self.pos]);
             if newline.is_some() {
                 let mut len = self.record.len() - 1;

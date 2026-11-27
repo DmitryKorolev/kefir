@@ -21,7 +21,9 @@ fn compose(
         let mut n = name;
         while !same(work.names, n, stop, work.budget)? {
             let Some((p, _)) = work.names.view(n, work.budget)? else {
-                return Err(ResourceError::Invariant.into());
+                // Family ownership comes from the checked constructor list.
+                // An imported name can lack the prefix needed for this rewrite.
+                return Err(Stop::Unsupported);
             };
             push_frame(&mut path, n, work.budget)?;
             n = p;

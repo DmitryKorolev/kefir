@@ -236,6 +236,34 @@ impl Working<'_> {
         scope: Scope<'_>,
         environment: &Environment,
     ) -> Result<Option<LevelId>, Stop> {
+        self.formation_sort_query(
+            crate::check::environment::kernel::FormationInput::Expression(root),
+            scope,
+            environment,
+        )
+    }
+
+    /// The constructor walker supplies its checked opened domain in this scope.
+    /// Refusal carries no sort and leaves the checked formation route available.
+    pub(crate) fn formed_field_sort(
+        &mut self,
+        field: CheckedTy,
+        scope: Scope<'_>,
+        environment: &Environment,
+    ) -> Result<Option<LevelId>, Stop> {
+        self.formation_sort_query(
+            crate::check::environment::kernel::FormationInput::FormedField(field),
+            scope,
+            environment,
+        )
+    }
+
+    fn formation_sort_query(
+        &mut self,
+        input: crate::check::environment::kernel::FormationInput,
+        scope: Scope<'_>,
+        environment: &Environment,
+    ) -> Result<Option<LevelId>, Stop> {
         if let Some(error) = self.owned_cleanup {
             return Err(error.into());
         }
@@ -254,7 +282,7 @@ impl Working<'_> {
             self.check_formation_origin(scope)?;
             crate::check::environment::kernel::formation_sort(
                 environment,
-                root,
+                input,
                 &scope,
                 pre_staging,
                 self.context,
@@ -315,6 +343,29 @@ impl Working<'_> {
         })();
         self.owned_failure = result.as_ref().err().copied();
         result
+    }
+
+    /// Consume a staged rule probe's temporary syntax after its kernel and
+    /// binding scratch have retired. The probe may not modify locals, names
+    /// or signatures, and returns only a boolean. Cleanup failure is terminal.
+    pub(crate) fn retire_rule_probe(
+        &mut self,
+        expressions: crate::syntax::expressions::Watermark,
+        levels: usize,
+    ) -> Result<(), Stop> {
+        if let Some(error) = self.owned_cleanup {
+            return Err(error.into());
+        }
+        if let Some(error) = self.owned_failure {
+            return Err(error);
+        }
+        self.owned_cleanup = Some(ResourceError::Invariant);
+        let result = self
+            .expressions
+            .discard_since(expressions, self.budget)
+            .and_then(|()| self.levels.discard_since(levels, self.budget));
+        self.owned_cleanup = result.as_ref().err().copied();
+        result.map_err(Stop::Resource)
     }
 
     /// Establish type formation, including the demanded inferred-type exposure.

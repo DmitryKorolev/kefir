@@ -1,6 +1,7 @@
 //! Simultaneous substitution on a caller-validated frozen template.
 //! Completed-source memo shares generated composites only within this operation;
-//! generated results are forbidden as later sources. No U/N judgment is computed.
+//! generated results are forbidden as later sources. Generated-template callers
+//! may only reuse handles predating the operation. No U/N judgment is computed.
 use super::*;
 use crate::syntax::levels::NameId;
 
@@ -138,6 +139,7 @@ const _: () = assert!(size_of::<Frame>() == 12);
 pub(crate) struct Substitution<'h, 'a, N, const CACHED: bool = true> {
     h: &'h mut Helpers<'a, N>,
     source_end: usize,
+    existing_end: usize,
     parameters: Map,
     completed: Map,
     frames: Vec<Frame>,
@@ -179,6 +181,7 @@ impl Levels {
         self.with_helpers(names, b, |h| {
             h.budget.charge_work(3)?;
             let mut s = Substitution {
+                existing_end: h.levels.len(),
                 h,
                 source_end,
                 parameters: Map::default(),
@@ -223,8 +226,16 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
         self.frames.push(frame);
         Ok(())
     }
-    fn remember(&mut self, source: LevelId, result: LevelId) -> Result<LevelId, ResourceError> {
-        if self.cached() {
+    fn remember(
+        &mut self,
+        source: LevelId,
+        result: LevelId,
+        stable: bool,
+    ) -> Result<LevelId, ResourceError> {
+        // A fixed substitution selecting an already existing handle selects that
+        // same handle on every visit. New composites remain fresh on the
+        // generated-template route, even across successive apply calls.
+        if self.cached() || (stable && (result.0 as usize) < self.existing_end) {
             self.completed.insert(source.0, result.0, self.h.budget)?;
         }
         Ok(result)
@@ -240,6 +251,9 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
         result
     }
     fn apply_inner(&mut self, root: LevelId) -> Result<LevelId, ResourceError> {
+        // On a shallow generated template, the map can cost more than
+        // repeating the walk. Frozen-template callers keep their usual policy.
+        let stable = !CACHED && self.h.levels.get(root, self.h.budget)?.depth() >= 8;
         let mut current = root;
         'descend: loop {
             self.h.budget.charge_work(1)?;
@@ -252,7 +266,7 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
             let node = self.h.levels.get(current, self.h.budget)?;
             let mut result = if !node.has_param() {
                 current
-            } else if let Some(entry) = if self.cached() {
+            } else if let Some(entry) = if self.cached() || stable {
                 self.completed.get(current.0, self.h.budget)?
             } else {
                 None
@@ -266,7 +280,7 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
                             .parameters
                             .get(key, self.h.budget)?
                             .ok_or(ResourceError::Invariant)?;
-                        self.remember(current, LevelId(result.value))?
+                        self.remember(current, LevelId(result.value), stable)?
                     }
                     LevelKind::Succ(first)
                     | LevelKind::Max(first, _)
@@ -299,9 +313,17 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
                                 self.h.budget,
                             )?
                         };
-                        self.remember(frame.source, result)?
+                        self.remember(frame.source, result, stable)?
                     }
                     kind @ (LevelKind::Max(a, second) | LevelKind::IMax(a, second)) => {
+                        if !frame.second && a == second {
+                            // Two substitutions of one source select the same original or
+                            // produce structurally equal fresh values. M and I select the
+                            // first result on that tie. Keep the raw parent if unchanged.
+                            let selected = if result == a { frame.source } else { result };
+                            result = self.remember(frame.source, selected, stable)?;
+                            continue;
+                        }
                         if !frame.second {
                             self.push(Frame {
                                 source: frame.source,
@@ -318,7 +340,7 @@ impl<N: LevelNames, const CACHED: bool> Substitution<'_, '_, N, CACHED> {
                         } else {
                             self.h.imax(frame.first, result)?
                         };
-                        self.remember(frame.source, result)?
+                        self.remember(frame.source, result, stable)?
                     }
                     _ => return Err(ResourceError::Invariant),
                 };

@@ -16,6 +16,16 @@ enum Pair {
     Level(LevelId, LevelId),
 }
 pub(super) fn matches(work: &mut Working<'_>, a: ExprId, b: ExprId) -> Result<bool, Stop> {
+    compare::<false>(work, a, b)
+}
+
+/// Raw identity for specialization keys includes the exact metadata payload.
+/// Schema matching retains its own eligibility rule for metadata.
+pub(super) fn nested_key(work: &mut Working<'_>, a: ExprId, b: ExprId) -> Result<bool, Stop> {
+    compare::<true>(work, a, b)
+}
+
+fn compare<const KEY: bool>(work: &mut Working<'_>, a: ExprId, b: ExprId) -> Result<bool, Stop> {
     let mut pairs = Vec::new();
     let mut memo = Memo::default();
     work.budget.reserve(96)?;
@@ -123,6 +133,13 @@ pub(super) fn matches(work: &mut Working<'_>, a: ExprId, b: ExprId) -> Result<bo
                             if a != b {
                                 return Ok(false);
                             }
+                        }
+                        (ExprKind::MData(a, c), ExprKind::MData(b, d)) if KEY => {
+                            work.budget.charge_work(a.len() as u64 + 1)?;
+                            if a != b {
+                                return Ok(false);
+                            }
+                            pair(work, &mut pairs, Pair::Expression(c, d), false)?;
                         }
                         (ExprKind::Projection(a, i, c), ExprKind::Projection(b, j, d))
                             if i == j =>

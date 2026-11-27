@@ -6,6 +6,9 @@ use super::*;
 struct Owned {
     constant_slots: Vec<ConstantSlot>,
     constant_epoch: u32,
+    // This hint only schedules a fresh isolated retry after ordinary checking
+    // fails. Restored positive caches may bypass the lookup that first set it.
+    wants_quot: bool,
     const_by_canon: Map<u32, u32>,
     vals: Vec<Val>,
     meta: Vec<Meta>,
@@ -20,7 +23,7 @@ struct Owned {
     let_marks: Vec<u64>,
     memo: Exact,
     clo_index: Lossy<(u32, u32, u32, u32, u32, u32), u32>,
-    env_index: Map<(u32, u32, u32), u32>,
+    env_index: NodeIndex,
     env_lossy: Lossy<EnvKey, u32>,
     infer_cache: Map<(u32, u32, u32), (u32, bool)>,
     const_type: Map<(u32, u32), u32>,
@@ -58,6 +61,7 @@ impl Owned {
         Self {
             constant_slots: std::mem::take(&mut k.constant_slots),
             constant_epoch: k.constant_epoch,
+            wants_quot: k.wants_quot,
             const_by_canon: std::mem::take(&mut k.const_by_canon),
             vals: std::mem::take(&mut k.vals),
             meta: std::mem::take(&mut k.meta),
@@ -110,6 +114,7 @@ impl Owned {
         k.constant_slots = self.constant_slots;
         // start checks overflow before ownership transfer; old view stamps are stale.
         k.constant_epoch = self.constant_epoch + 1;
+        k.wants_quot |= self.wants_quot;
         k.const_by_canon = self.const_by_canon;
         k.vals = self.vals;
         k.meta = self.meta;
@@ -168,7 +173,7 @@ struct Snapshot {
     reserved: u64,
 }
 
-const QUOTA: u64 = 16 << 20;
+const QUOTA: u64 = 20 << 20;
 
 // Constant-size reachability evidence in test binaries only; no production
 // state, event, charge or per-declaration telemetry is added.
@@ -179,11 +184,17 @@ const QUOTA: u64 = 16 << 20;
 /// The header stays charged while empty; payload charges move with its graph.
 #[derive(Default)]
 pub(in crate::check::environment) struct Retention {
+    graph: GraphRetention,
+    source: SourceJudgments,
+}
+
+#[derive(Default)]
+pub(super) struct GraphRetention {
     slot: Vec<Snapshot>,
     published: bool,
 }
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Retention>() == 32);
+const _: () = assert!(size_of::<Retention>() == 128);
 
 /// Evaluate every cleanup first. An internal failure dominates a resource
 /// decline, matching the existing attempt/session cleanup selection.
@@ -242,16 +253,31 @@ where
     drop(values);
     release(k, bytes as u64)
 }
+fn index_charge<K: LossyKey, V: Copy>(index: &Lossy<K, V>) -> usize
+where
+    Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
+{
+    index.size * Lossy::<K, V>::SLOT
+}
+
 fn drop_lossy<K: LossyKey, V: Copy>(k: &mut Kernel<'_, '_>, values: Lossy<K, V>) -> R<()>
 where
     Option<(NonZeroU32, K, V)>: crate::resource::charged::Charged,
 {
-    let bytes = values.size * Lossy::<K, V>::SLOT;
+    let bytes = index_charge(&values);
     drop(values);
     release(k, bytes as u64)
 }
 
 impl Retention {
+    pub(super) fn stores_for_attempt(&mut self) -> (&mut GraphRetention, &mut SourceJudgments) {
+        (&mut self.graph, &mut self.source)
+    }
+
+    pub(super) fn abandon_source_judgments(&mut self) {
+        self.source.abandon();
+    }
+
     pub(super) fn eligible(
         k: &Kernel<'_, '_>,
         request: &Request<'_>,
@@ -266,6 +292,27 @@ impl Retention {
             && k.levels.len() == k.level_end
     }
 
+    /// Called only after session cleanup, publication and checked-count update.
+    /// No allocation, charge or other fallible operation follows installation.
+    pub(in crate::check::environment) fn publish(&mut self) {
+        self.source.publish();
+        self.graph.published = !self.graph.slot.is_empty();
+    }
+
+    /// Idempotent terminal retirement, including early justified rejection.
+    /// Drop every owner before selecting errors; a resource failure proves no
+    /// negative and can never leave enough state to resume checking.
+    pub(in crate::check::environment) fn retire(
+        &mut self,
+        budget: &mut Budget,
+    ) -> Result<(), ResourceError> {
+        let graph = self.graph.retire(budget);
+        let judgments = self.source.retire(budget);
+        select_cleanup([graph, judgments])
+    }
+}
+
+impl GraphRetention {
     fn allocate_header(&mut self, budget: &mut Budget) -> Result<(), ResourceError> {
         if self.slot.capacity() == 1 {
             return Ok(());
@@ -335,7 +382,7 @@ impl Retention {
             || k.markers != 0
             || !k.binders.is_empty()
             || !k.free_values.is_empty()
-            || k.wants_quot
+            || k.quot_types.is_some()
         {
             return Ok(());
         }
@@ -367,12 +414,46 @@ impl Retention {
         // Only positive rule trees travel with the graph.
         k.keep_trees()?;
         // Count the persistent header exactly once, even before its allocation.
-        if k.reserved
+        let footprint = k
+            .reserved
             .saturating_add(level_bytes as u64)
-            .saturating_add(crate::resource::charged::bytes::<Snapshot>() as u64)
-            > QUOTA
-        {
-            return Ok(());
+            .saturating_add(crate::resource::charged::bytes::<Snapshot>() as u64);
+        if footprint > QUOTA {
+            let need = footprint - QUOTA;
+            // Construction indexes point into the owned graph. No graph edge
+            // points back into an index, and a miss grants no typing judgment.
+            let sizes = [
+                index_charge(&k.val_index),
+                index_charge(&k.cell_index),
+                index_charge(&k.clo_index),
+                index_charge(&k.env_lossy),
+            ];
+            let single = sizes
+                .iter()
+                .enumerate()
+                .filter(|(_, size)| **size as u64 >= need)
+                .min_by_key(|(_, size)| **size)
+                .map(|(index, _)| index);
+            macro_rules! discard {
+                ($field:ident) => {{
+                    let old = std::mem::take(&mut k.$field);
+                    drop_lossy(k, old)?;
+                }};
+            }
+            match single {
+                Some(0) => discard!(val_index),
+                Some(1) => discard!(cell_index),
+                Some(2) => discard!(clo_index),
+                Some(3) => discard!(env_lossy),
+                Some(_) => return Err(ResourceError::Invariant.into()),
+                None if sizes.iter().map(|&size| size as u64).sum::<u64>() >= need => {
+                    discard!(val_index);
+                    discard!(cell_index);
+                    discard!(clo_index);
+                    discard!(env_lossy);
+                }
+                None => return Ok(()),
+            }
         }
         self.allocate_header(k.b)?;
         k.steps_by(count as u64)?;
@@ -395,19 +476,7 @@ impl Retention {
         Ok(())
     }
 
-    /// Called only after session cleanup, publication and checked-count update.
-    /// No allocation, charge or other fallible operation follows installation.
-    pub(in crate::check::environment) fn publish(&mut self) {
-        self.published = !self.slot.is_empty();
-    }
-
-    /// Idempotent terminal retirement, including early justified rejection.
-    /// Drop every owner before selecting errors; a resource failure proves no
-    /// negative and can never leave enough state to resume checking.
-    pub(in crate::check::environment) fn retire(
-        &mut self,
-        budget: &mut Budget,
-    ) -> Result<(), ResourceError> {
+    fn retire(&mut self, budget: &mut Budget) -> Result<(), ResourceError> {
         self.published = false;
         let mut slot = std::mem::take(&mut self.slot);
         let header = (slot.capacity() * crate::resource::charged::bytes::<Snapshot>()) as u64;
@@ -436,5 +505,5 @@ impl Retention {
 
 // Charged sizes (64-bit layout) of this module's stored types.
 crate::resource::charged::charged! {
-    Snapshot => 1872,
+    Snapshot => 1880,
 }

@@ -81,6 +81,15 @@ fn resource(error: ResourceError) -> Failure {
         cause: Cause::Resource(error),
     }
 }
+fn expression_error(error: ExpressionError) -> Cause {
+    match error {
+        ExpressionError::Resource(error) => Cause::Resource(error),
+        ExpressionError::NumericRange => Cause::NumericRange,
+        ExpressionError::InvalidNatural | ExpressionError::InvalidString => {
+            Cause::Resource(ResourceError::Invariant)
+        }
+    }
+}
 fn index_error(error: IndexError) -> Cause {
     match error {
         IndexError::Resource(e) => Cause::Resource(e),
@@ -516,15 +525,7 @@ impl Decoder {
                     };
                     self.expressions.append(value, &self.levels, &self.names, b)
                 };
-                let expression = appended.map_err(|error| {
-                    fail(match error {
-                        ExpressionError::Resource(error) => Cause::Resource(error),
-                        ExpressionError::NumericRange => Cause::NumericRange,
-                        ExpressionError::InvalidNatural | ExpressionError::InvalidString => {
-                            Cause::Resource(ResourceError::Invariant)
-                        }
-                    })
-                })?;
+                let expression = appended.map_err(|error| fail(expression_error(error)))?;
                 insert_id(&mut self.expression_ids, expression.slot(), b)
                     .map_err(|e| fail(index_error(e)))?;
                 Published::Expr(expression)

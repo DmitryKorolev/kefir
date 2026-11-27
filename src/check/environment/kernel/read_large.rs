@@ -92,6 +92,11 @@ impl Kernel<'_, '_> {
             });
         // One known-size admission covers parent reads and prefix interning.
         self.steps_by(highest + u64::from(n))?;
+        let original_env = env;
+        let short_mask = highest <= 64;
+        if short_mask && let Some(token) = self.completed_type_keys.get(env, mask[0]) {
+            return Ok(Some((e.slot(), li, u32::from(checking), token)));
+        }
         let (mut pos, mut token) = (0, 0);
         for (word, mut bits) in mask.into_iter().enumerate() {
             while bits != 0 {
@@ -130,6 +135,9 @@ impl Kernel<'_, '_> {
                     }
                 };
             }
+        }
+        if short_mask {
+            self.completed_type_keys.put(original_env, mask[0], token);
         }
         Ok(Some((e.slot(), li, u32::from(checking), token)))
     }

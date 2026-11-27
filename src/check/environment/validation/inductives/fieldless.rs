@@ -752,10 +752,10 @@ impl State {
                 budget,
             )
             .map_err(resource)?;
-        let mut valid_constructors = true;
-        let mut large_fields = true;
+        let mut matched = true;
+        let mut checking_generated = false;
+        let mut k = false;
         let mut recursive = false;
-        let mut reflexive = false;
         let negative = decoder
             .declaration_session(budget, |work| {
                 with_scratch(work, |work, s| {
@@ -784,12 +784,10 @@ impl State {
                                 family.ty,
                             )],
                         );
-                        valid_constructors = false;
+                        matched = false;
                         return Ok(());
                     }
-                    large_fields = s.large_fields;
                     recursive = s.recursive;
-                    reflexive = s.reflexive;
                     for (i, &name) in constructors.iter().enumerate() {
                         let fields = s.field_count(i)?;
                         let mut declaration = None;
@@ -806,7 +804,7 @@ impl State {
                             || rule.num_fields != fields
                             || !same(work.names, rule.constructor, name, work.budget)?
                         {
-                            valid_constructors = false;
+                            matched = false;
                             return Ok(());
                         }
                         scheme::push(
@@ -819,86 +817,87 @@ impl State {
                             },
                         )?;
                     }
-                    Ok(())
-                })
-            })
-            .map_err(|e| e.failure_report())?;
-        if negative.is_some()
-            || !valid_constructors
-            || family.is_recursive != recursive
-            || family.is_reflexive != reflexive
-        {
-            return Ok(Admission::TypeMismatch);
-        }
-        // Direction of use: Proven permits the large
-        // recursor shape; NotProven contributes nothing and falls back to the
-        // structural large_fields derivation. `zero` is the total decision.
-        let large = positive == LevelPositive::Proven || (constructors.len() <= 1 && large_fields);
-        let k = zero == LevelZero::Zero && constructors.len() == 1 && rules[0].num_fields == 0;
-        if recursor.k != k {
-            return Ok(Admission::TypeMismatch);
-        }
-        let names = decoder.syntax().0;
-        let universe = if large {
-            if rec_parameters.len() != parameters.len() + 1
-                || !parameters_equal(names, &rec_parameters[1..], parameters, budget)
-                    .map_err(resource)?
-                || !fresh_parameter(names, parameters, rec_parameters[0], budget)
-                    .map_err(resource)?
-            {
-                return Ok(Admission::TypeMismatch);
-            }
-            Some(rec_parameters[0])
-        } else {
-            if !parameters_equal(names, rec_parameters, parameters, budget).map_err(resource)? {
-                return Ok(Admission::TypeMismatch);
-            }
-            None
-        };
-        for &name in constructors {
-            let mut ty = None;
-            for c in request.constructors {
-                budget.charge_work(1).map_err(resource)?;
-                if same(decoder.syntax().0, name, c.name, budget).map_err(resource)? {
-                    ty = Some(c.ty);
-                    break;
-                }
-            }
-            phase = self
-                .environment
-                .stage_signature(
-                    phase,
-                    SignatureInput {
-                        kind: SignatureKind::Constructor,
-                        name,
-                        parameters,
-                        ty: ty.ok_or_else(|| resource(ResourceError::Invariant))?,
-                        all,
-                    },
-                    decoder.syntax().0,
-                    budget,
-                )
-                .map_err(resource)?;
-        }
-        let mut matched = true;
-        let negative = decoder
-            .declaration_session(budget, |work| {
-                with_scratch(work, |work, s| {
-                    let scope = scope(Some(phase), rec_parameters);
-                    s.family(work, request, scope, &self.environment)?;
-                    if !s.constructors(work, request, scope, &self.environment)? {
-                        return Err(ResourceError::Invariant.into());
+                    if family.is_recursive != recursive || family.is_reflexive != s.reflexive {
+                        matched = false;
+                        return Ok(());
                     }
-                    s.add_motives(work, universe, scope, &self.environment)?;
+                    // Direction of use: Proven permits the large
+                    // recursor shape; NotProven contributes nothing and falls back to the
+                    // structural large_fields derivation. `zero` is the total decision.
+                    let large = positive == LevelPositive::Proven
+                        || (constructors.len() <= 1 && s.large_fields);
+                    k = zero == LevelZero::Zero
+                        && constructors.len() == 1
+                        && rules[0].num_fields == 0;
+                    if recursor.k != k {
+                        matched = false;
+                        return Ok(());
+                    }
+                    let names = &*work.names;
+                    let universe = if large {
+                        if rec_parameters.len() != parameters.len() + 1
+                            || !parameters_equal(
+                                names,
+                                &rec_parameters[1..],
+                                parameters,
+                                work.budget,
+                            )?
+                            || !fresh_parameter(names, parameters, rec_parameters[0], work.budget)?
+                        {
+                            matched = false;
+                            return Ok(());
+                        }
+                        Some(rec_parameters[0])
+                    } else {
+                        if !parameters_equal(names, rec_parameters, parameters, work.budget)? {
+                            matched = false;
+                            return Ok(());
+                        }
+                        None
+                    };
+                    for &name in constructors {
+                        let mut ty = None;
+                        for c in request.constructors {
+                            work.budget.charge_work(1)?;
+                            if same(work.names, name, c.name, work.budget)? {
+                                ty = Some(c.ty);
+                                break;
+                            }
+                        }
+                        phase = self.environment.stage_signature(
+                            phase,
+                            SignatureInput {
+                                kind: SignatureKind::Constructor,
+                                name,
+                                parameters,
+                                ty: ty.ok_or(ResourceError::Invariant)?,
+                                all,
+                            },
+                            work.names,
+                            work.budget,
+                        )?;
+                    }
+                    // Constructor locals use the family universes. The checked parameter
+                    // relation above permits only a fresh elimination universe here.
+                    checking_generated = true;
+                    let recursor_scope = scope(Some(phase), rec_parameters);
+                    s.add_motives(work, universe, recursor_scope, &self.environment)?;
                     let generated = s.recursor(work, family.name)?;
                     work.check_root_scope(rec_parameters, &[generated])?;
-                    work.check_type(
+                    if !s.formed_recursor_type(
+                        work,
                         generated,
-                        false,
-                        ReductionPath::start(),
-                        scope,
+                        recursor_scope,
                         &self.environment,
-                    )?;
+                    )? {
+                        work.check_type(
+                            generated,
+                            false,
+                            ReductionPath::start(),
+                            recursor_scope,
+                            &self.environment,
+                        )?;
+                    }
                     matched = scheme::matches(work, generated, recursor.ty)?;
                     if !matched {
                         #[cfg(feature = "introspection")]
@@ -917,77 +916,57 @@ impl State {
                                 ),
                             ],
                         );
+                        return Ok(());
+                    }
+                    // The telescope's checked local types weaken along this fresh
+                    // signature-only extension. No query cache crosses phases.
+                    phase = self.environment.stage_signature(
+                        phase,
+                        SignatureInput {
+                            kind: SignatureKind::Recursor,
+                            name: recursor.name,
+                            parameters: rec_parameters,
+                            ty: recursor.ty,
+                            all: rec_all,
+                        },
+                        work.names,
+                        work.budget,
+                    )?;
+                    let scope = scope(Some(phase), rec_parameters);
+                    for (i, rule) in rules.iter().enumerate() {
+                        let rhs = s.rhs(work, recursor.name, i)?;
+                        work.check_root_scope(rec_parameters, &[rhs])?;
+                        s.recheck(work, rhs, i, scope, &self.environment)?;
+                        if !scheme::matches(work, rhs, rule.rhs)? {
+                            #[cfg(feature = "introspection")]
+                            capture_work(
+                                work,
+                                family.name,
+                                &[crate::report::failure_snapshot::Rule::ExportMatch],
+                                &[
+                                    crate::report::failure_snapshot::Identity::expression(
+                                        crate::report::failure_snapshot::Role::Expected,
+                                        rhs,
+                                    ),
+                                    crate::report::failure_snapshot::Identity::expression(
+                                        crate::report::failure_snapshot::Role::Actual,
+                                        rule.rhs,
+                                    ),
+                                ],
+                            );
+                            matched = false;
+                            break;
+                        }
                     }
                     Ok(())
                 })
             })
             .map_err(|e| e.failure_report())?;
-        if negative.is_some() {
+        if checking_generated && negative.is_some() {
             return Err(resource(ResourceError::Invariant));
         }
-        if !matched {
+        if negative.is_some() || !matched {
             return Ok(Admission::TypeMismatch);
-        }
-        phase = self
-            .environment
-            .stage_signature(
-                phase,
-                SignatureInput {
-                    kind: SignatureKind::Recursor,
-                    name: recursor.name,
-                    parameters: rec_parameters,
-                    ty: recursor.ty,
-                    all: rec_all,
-                },
-                decoder.syntax().0,
-                budget,
-            )
-            .map_err(resource)?;
-        if !rules.is_empty() {
-            let negative = decoder
-                .declaration_session(budget, |work| {
-                    with_scratch(work, |work, s| {
-                        let scope = scope(Some(phase), rec_parameters);
-                        s.family(work, request, scope, &self.environment)?;
-                        if !s.constructors(work, request, scope, &self.environment)? {
-                            return Err(ResourceError::Invariant.into());
-                        }
-                        s.add_motives(work, universe, scope, &self.environment)?;
-                        for (i, rule) in rules.iter().enumerate() {
-                            let rhs = s.rhs(work, recursor.name, i)?;
-                            work.check_root_scope(rec_parameters, &[rhs])?;
-                            s.recheck(work, rhs, i, scope, &self.environment)?;
-                            if !scheme::matches(work, rhs, rule.rhs)? {
-                                #[cfg(feature = "introspection")]
-                                capture_work(
-                                    work,
-                                    family.name,
-                                    &[crate::report::failure_snapshot::Rule::ExportMatch],
-                                    &[
-                                        crate::report::failure_snapshot::Identity::expression(
-                                            crate::report::failure_snapshot::Role::Expected,
-                                            rhs,
-                                        ),
-                                        crate::report::failure_snapshot::Identity::expression(
-                                            crate::report::failure_snapshot::Role::Actual,
-                                            rule.rhs,
-                                        ),
-                                    ],
-                                );
-                                matched = false;
-                                break;
-                            }
-                        }
-                        Ok(())
-                    })
-                })
-                .map_err(|e| e.failure_report())?;
-            if negative.is_some() {
-                return Err(resource(ResourceError::Invariant));
-            }
-            if !matched {
-                return Ok(Admission::TypeMismatch);
-            }
         }
         let predicates = self
             .environment

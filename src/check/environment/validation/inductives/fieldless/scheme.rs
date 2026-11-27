@@ -4,6 +4,7 @@ use crate::check::environment::CheckednessMint;
 use crate::syntax::expressions::binding::Binding;
 use crate::syntax::levels::{LevelId, LevelZero};
 use crate::syntax::local_context::{CheckedTy, FreeId};
+mod opened_telescope;
 mod templates;
 pub(super) use templates::{ConstructorInput, FamilyInput, Templates};
 
@@ -448,6 +449,7 @@ impl Scratch {
                 let mut current = constructor.ty;
                 let mut path =
                     work.check_type(current, false, ReductionPath::start(), scope, environment)?;
+                let mut identical_parameters = true;
                 for parameter in &self.binders[..self.parameters] {
                     // Constructor prefixes are syntactic, never erased by WHNF.
                     let ExprKind::Pi(_, domain, body, _) = kind(work, current)? else {
@@ -461,6 +463,7 @@ impl Scratch {
                         if session.structurally_identical(domain, parameter.ty)? {
                             Ok(0)
                         } else {
+                            identical_parameters = false;
                             let result = session
                                 .compare(domain, incoming, parameter.ty, incoming)
                                 .map(|(a, b)| a.height.max(b.height));
@@ -470,20 +473,29 @@ impl Scratch {
                     path = incoming.after_height(height)?;
                     current = substitute(work, body, parameter.expression)?;
                 }
+                // Later field exposure advances the ordinary path. Opening the
+                // checked Pi body with a fresh local of its exact domain
+                // preserves formation of the remaining telescope at every step.
+                let formed_prefix = identical_parameters && path == ReductionPath::start();
                 let field_start = self.fields.len();
                 while let ExprKind::Pi(_, domain, body, _) = kind(work, current)? {
-                    // isReflexive observes the syntactic opened field domain before
-                    // WHNF, independently of recursive-argument classification.
-                    if matches!(kind(work, domain)?, ExprKind::Pi(..))
-                        && !no_block(work, domain, &self.family_set)?
-                    {
-                        self.reflexive = true;
-                    }
                     // The raw pass established original uniformity. Keep the original
                     // opened domain in the local; WHNF is only for classification.
-                    let sort = if let Some(sort) =
-                        work.try_formation_sort(domain, scope, environment)?
-                    {
+                    // Inversion of the completed constructor Pi check gives a
+                    // formed domain under its original prefix. Each substitution
+                    // above uses the checked family local at the same domain,
+                    // or an earlier fresh field local of its exact opened type.
+                    let recovered = if formed_prefix {
+                        let field = CheckedTy::checked(domain, CheckednessMint::mint());
+                        work.formed_field_sort(field, scope, environment)?
+                    } else {
+                        None
+                    };
+                    let positive = match recovered {
+                        Some(sort) => Some(sort),
+                        None => work.try_formation_sort(domain, scope, environment)?,
+                    };
+                    let sort = if let Some(sort) = positive {
                         // Independently bounded positive engine; incoming
                         // ordinary path is preserved, not reset or synthesized.
                         sort
@@ -511,6 +523,7 @@ impl Scratch {
                     let exposed = work.expose_checked(domain, path, scope, environment)?;
                     let Some(classified) = self.recursive_field(
                         work,
+                        domain,
                         exposed.expression,
                         exposed.path,
                         scope,
@@ -522,7 +535,6 @@ impl Scratch {
                     let recursive = classified.indices;
                     let telescope = classified.telescope;
                     path = classified.path;
-                    self.recursive |= recursive.is_some();
                     let mut local = binder(work, domain, path)?;
                     local.generated_ty = generated_ty;
                     push(
@@ -628,6 +640,7 @@ impl Scratch {
     fn recursive_field(
         &mut self,
         work: &mut Working<'_>,
+        domain: ExprId,
         root: ExprId,
         mut path: ReductionPath,
         scope: Scope<'_>,
@@ -635,7 +648,20 @@ impl Scratch {
     ) -> Result<Option<RecursiveField>, Stop> {
         let start =
             u32::try_from(self.recursive_binders.len()).map_err(|_| ResourceError::Counter)?;
-        if no_block(work, root, &self.family_set)? {
+        let exposed_free = no_block(work, root, &self.family_set)?;
+        let raw_pi = matches!(kind(work, domain)?, ExprKind::Pi(..));
+        if !self.recursive || (raw_pi && !self.reflexive) {
+            // The raw pass excluded block-named projections. On these checked
+            // domains the membership scan therefore detects family constants.
+            let raw_occurs = if domain == root {
+                !exposed_free
+            } else {
+                !no_block(work, domain, &self.family_set)?
+            };
+            self.recursive |= raw_occurs;
+            self.reflexive |= raw_pi && raw_occurs;
+        }
+        if exposed_free {
             return Ok(Some(RecursiveField {
                 family: 0,
                 indices: None,
@@ -1063,7 +1089,9 @@ impl Scratch {
         // Exact exported schema matching remains separate. This internal typed
         // check uses conversion only after expected itself has checked Sort.
         // No required artifact pass is omitted, and failure proves nothing.
-        if work.check_formation_rule(applied, expected, scope, environment)? {
+        if opened_telescope::check(work, rhs, applied, expected, scope, environment)?
+            || work.check_formation_rule(applied, expected, scope, environment)?
+        {
             return Ok(());
         }
         let actual = work.infer_at(applied, ReductionPath::start(), scope, environment)?;

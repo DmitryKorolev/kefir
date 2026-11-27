@@ -101,7 +101,7 @@ impl Rejection {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     std::mem::size_of::<Complete>()
-        == 1008 + std::mem::size_of::<super::theorem_judgments::Judgments>()
+        == 1104 + std::mem::size_of::<super::theorem_judgments::RootCaches>()
 );
 impl Complete {
     pub(crate) fn rejection(&self) -> Option<Rejection> {
@@ -223,7 +223,7 @@ pub(crate) fn check_with_axiom_policy<R: Read>(
     let result = loop {
         // This is evidence for this callback only, never the preceding record.
         kind = None;
-        let next = stream.next(budget, |item, decoder, budget| {
+        let next = stream.next_ignoring_syntax(budget, |item, decoder, budget| {
             let declaration_kind = match &item {
                 Item::Declaration(request) => Some(match request.kind {
                     Kind::Axiom => DeclarationKind::Axiom,

@@ -145,6 +145,25 @@ impl IdIndex {
         }
     }
 
+    /// Every ID below the established prefix maps to its original slot.
+    pub(crate) fn in_prefix(&self, id: u32) -> bool {
+        u64::from(id) < self.prefix
+    }
+
+    /// Before the first sparse admission, prefix IDs are identical to slots.
+    pub(crate) fn next_dense(&self, number: u32) -> bool {
+        !self.frozen && u64::from(number) == self.prefix && self.prefix == self.next_slot
+    }
+
+    pub(crate) fn insert_dense(&mut self, number: u32, slot: u32) -> Result<(), IndexError> {
+        if !self.next_dense(number) || number != slot {
+            return Err(IndexError::SlotOrder);
+        }
+        self.prefix += 1;
+        self.next_slot += 1;
+        Ok(())
+    }
+
     /// Same canonical-token premise as resolve_canonical_u32. The dense branch
     /// is exactly insert's successful prefix admission, after syntax publication.
     /// Every other case retains insert's original validation/failure ordering.

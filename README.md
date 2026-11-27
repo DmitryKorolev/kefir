@@ -9,17 +9,8 @@ declarations exported by [lean4export](https://github.com/leanprover/lean4export
 (format 3.1.0) and checks every type and proof itself, including inductive types
 and their recursors, which it re-derives rather than taking from the export.
 
-![Mathlib: peak memory against instructions for every checker on the Lean Kernel Arena](images/kefir-pareto-mathlib-public-20261030-1908.png)
-
-On the [Lean Kernel Arena](https://arena.lean-lang.org) snapshot of 2026-10-30
-(arena `09206c81`, kefir `d6c0194`), kefir has the lowest peak memory of any checker
-on all seven library inputs, and is on the memory–instruction Pareto frontier for
-each of them. On Reachability, a smaller application input, lazylean uses both less
-memory and fewer instructions. kefir is not the fastest: on Mathlib, sokonanoda and
-mathgraph execute about 5.0× and 3.1× fewer instructions, with 2.2× and 2.8× kefir's
-peak memory.
-
-![Memory–instruction Pareto frontiers for the seven library inputs and Reachability](images/kefir-pareto-eight-inputs-public-20261030-1908.png)
+Current instruction and peak-memory standings against other checkers are on the
+[Lean Kernel Arena](https://arena.lean-lang.org).
 
 Acceptance is relative to the axioms the report lists. It does not establish that
 a theorem states the intended claim or that its assumptions are justified.
@@ -66,8 +57,7 @@ answers mean, and how it computes.
 - **Equalities are not chained.** Lean's kernel joins proven equalities into
   classes, so a = b and b = c answer a = c without a check. kefir compares a
   and c itself, because chaining makes an incomplete procedure's answers
-  depend on the order of comparisons. Measured on the library inputs,
-  chaining would change instructions by about 1% either way.
+  depend on the order of comparisons.
 
 ### How it computes
 
@@ -175,8 +165,6 @@ declines; it never accepts or rejects.
   gives up an attempt before the end of the reservation.
 - **Storage:** up to 16 GiB of managed live storage, plus fixed limits on input size,
   record size, nesting depth and charged work.
-- **Measured peak memory** on the Lean Kernel Arena libraries: 2.43 GiB on Mathlib,
-  at most 1.05 GiB on the others.
 
 Overflow checks stay enabled in release builds.
 

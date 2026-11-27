@@ -27,6 +27,8 @@ pub(crate) enum Negative {
     OpenDeclaration,
     MissingConstant,
     UnsafeReference,
+    /// A visible constant applied with a universe instance of the wrong length.
+    UniverseArity,
     InvalidProjection,
     TypeMismatch,
 }
@@ -56,6 +58,11 @@ impl Stop {
             Stop::Inference(HeadError::Use(
                 crate::check::environment::normalization::UseError::UnsafeUse,
             )) => Negative::UnsafeReference,
+            // Only the ordinary inference lookup's completed arity
+            // check, never an observation, predicate or generated template.
+            Stop::Inference(HeadError::Use(
+                crate::check::environment::normalization::UseError::Arity,
+            )) => Negative::UniverseArity,
             _ => return None,
         })
     }

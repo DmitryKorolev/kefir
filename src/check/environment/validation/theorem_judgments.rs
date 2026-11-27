@@ -1,5 +1,6 @@
 //! Bounded completed original theorem judgments in one State/Decoder.
-//! Stores only T : Prop and p : T. It grants no declaration installation, name,
+//! A theorem stores T : Prop and p : T. A safe singleton definition stores
+//! only that T is a type and v : T. It grants no declaration installation, name,
 //! policy, metadata or whole-input verdict. Original syntax and committed names
 //! cannot be recycled/rebound in this owner; extension preserves these judgments.
 use crate::decode::primitive_decode::declarations::{Kind, Request, Safety};
@@ -9,13 +10,17 @@ use std::mem::size_of;
 use std::mem::take;
 
 const SLOTS: usize = 4096;
+mod committed_slots;
+use committed_slots::CommittedSlots;
 const BUCKETS: usize = SLOTS;
 const ADMISSION: u64 = 1 << 18;
+const MODERATE_ADMISSION: u64 = 4096;
 const HIT_REFRESH_WORK: u64 = 24;
 const PUBLICATION_WORK: u64 = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Key {
+    kind: Kind,
     ty: u32,
     value: u32,
     parameters: [u32; 4],
@@ -25,7 +30,57 @@ pub(super) struct Key {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Key>() == 28);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Option<Key>>() == 32);
+const _: () = assert!(size_of::<Option<Key>>() == 28);
+/// Borrowed for one ordinary declaration transaction. The committed index
+/// stores only a producer slot; it verifies this whole list against the
+/// immutable producer before granting any typing premise.
+#[derive(Clone, Copy)]
+pub(super) struct RequestKey<'a> {
+    kind: Kind,
+    ty: u32,
+    value: u32,
+    policy: u8,
+    parameters: &'a [crate::syntax::levels::NameId],
+}
+impl<'a> RequestKey<'a> {
+    // The State/Decoder pair owns these original source IDs for one run.
+    // No generated source, ValueId, local context or shortened hash is stored.
+    fn original(request: &Request<'a>, policy: crate::AxiomPolicy) -> Option<Self> {
+        if !(request.kind == Kind::Theorem
+            || (request.kind == Kind::Definition && request.all == [request.name]))
+            || request.safety != Safety::Safe
+        {
+            return None;
+        }
+        Some(Self {
+            kind: request.kind,
+            ty: request.ty.slot(),
+            value: request.value?.slot(),
+            parameters: request.parameters,
+            policy: match policy {
+                crate::AxiomPolicy::ExcludeNativeMarked => 0,
+                crate::AxiomPolicy::AllowAllDeclaredAxioms => 1,
+            },
+        })
+    }
+    fn clock_key(self) -> Option<Key> {
+        if self.kind != Kind::Theorem || self.parameters.len() > 4 {
+            return None;
+        }
+        let mut parameters = [0; 4];
+        for (out, name) in parameters.iter_mut().zip(self.parameters) {
+            *out = name.0;
+        }
+        Some(Key {
+            kind: self.kind,
+            ty: self.ty,
+            value: self.value,
+            policy: self.policy,
+            count: self.parameters.len() as u8,
+            parameters,
+        })
+    }
+}
 impl Key {
     fn bucket(self) -> usize {
         let mut h = 0x243f_6a88u64;
@@ -66,10 +121,12 @@ const _: () = assert!(size_of::<Entry>() == 36);
 const _: () = assert!(size_of::<Bucket>() == 4);
 // POISON is never an entry index. It fences any accidental standalone retry
 // after spending scan credits without successful publication; retire accepts it.
-const POISON: u16 = SLOTS as u16;
+const POISON: u16 = u16::MAX;
+
+pub(super) type Judgments = ClockJudgments<SLOTS>;
 
 #[derive(Default)]
-pub(super) struct Judgments {
+pub(super) struct ClockJudgments<const CAPACITY: usize> {
     entries: Vec<Entry>,
     buckets: Vec<Bucket>,
     pending: Option<Key>,
@@ -81,33 +138,112 @@ pub(super) struct Judgments {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Judgments>() == 88);
 
-impl Judgments {
+/// CLOCK holds only theorems. Committed slots also admit safe singleton
+/// definitions and recheck the producer kind before granting a hit.
+/// State poisons before entry, prepares at most one fresh producer per installed
+/// declaration, and calls finish before any further lookup or preparation.
+pub(super) struct RootCaches {
+    expensive: Judgments,
+    moderate: CommittedSlots,
+}
+
+impl RootCaches {
     pub(super) fn new() -> Self {
-        Self { ..Self::default() }
+        Self {
+            expensive: Judgments::new(),
+            moderate: CommittedSlots::default(),
+        }
     }
-    // The State/Decoder pair owns these original source IDs for one run.
-    // No generated source, ValueId, local context or shortened hash is stored.
-    pub(super) fn key(&self, request: &Request<'_>, policy: crate::AxiomPolicy) -> Option<Key> {
-        if request.kind != Kind::Theorem
-            || request.safety != Safety::Safe
-            || request.parameters.len() > 4
+
+    pub(super) fn key<'a>(
+        &self,
+        request: &Request<'a>,
+        policy: crate::AxiomPolicy,
+    ) -> Option<RequestKey<'a>> {
+        RequestKey::original(request, policy)
+    }
+
+    // Both indexes participate in one publication transaction. An unexpected
+    // second operation must fence either pending producer before examining a key.
+    fn require_ready(&mut self) -> Result<(), ResourceError> {
+        if self.moderate.ready()
+            && self.expensive.pending.is_none()
+            && self.expensive.hand != POISON
         {
-            return None;
+            return Ok(());
         }
-        let mut parameters = [0; 4];
-        for (out, parameter) in parameters.iter_mut().zip(request.parameters) {
-            *out = parameter.0;
+        self.finish(false);
+        Err(ResourceError::Invariant)
+    }
+
+    pub(super) fn completed_definition_scope(
+        &mut self,
+        key: Option<RequestKey<'_>>,
+        environment: &super::super::Environment,
+        budget: &mut Budget,
+    ) -> Result<bool, ResourceError> {
+        let Some(key) = key.filter(|k| k.kind == Kind::Definition) else {
+            return Ok(false);
+        };
+        if !self.moderate.ready()
+            || self.expensive.pending.is_some()
+            || self.expensive.hand == POISON
+        {
+            return Ok(false);
         }
-        Some(Key {
-            ty: request.ty.slot(),
-            value: request.value?.slot(),
-            parameters,
-            count: request.parameters.len() as u8,
-            policy: match policy {
-                crate::AxiomPolicy::ExcludeNativeMarked => 0,
-                crate::AxiomPolicy::AllowAllDeclaredAxioms => 1,
-            },
-        })
+        self.moderate
+            .completed_definition_scope(key, environment, budget)
+    }
+
+    pub(super) fn lookup(
+        &mut self,
+        key: Option<RequestKey<'_>>,
+        environment: &super::super::Environment,
+        budget: &mut Budget,
+    ) -> Result<bool, ResourceError> {
+        self.require_ready()?;
+        if self
+            .expensive
+            .lookup(key.and_then(RequestKey::clock_key), budget)?
+        {
+            return Ok(true);
+        }
+        self.moderate.lookup(key, environment, budget)
+    }
+
+    pub(super) fn prepare(
+        &mut self,
+        key: Option<RequestKey<'_>>,
+        work: u64,
+        slot: usize,
+        budget: &mut Budget,
+    ) -> Result<(), ResourceError> {
+        self.require_ready()?;
+        if work >= self.expensive.floor()
+            && let Some(compact) = key.and_then(RequestKey::clock_key)
+        {
+            self.expensive.prepare(Some(compact), work, budget)
+        } else {
+            self.moderate.prepare(key, work, slot, budget)
+        }
+    }
+
+    pub(super) fn finish(&mut self, installed: bool) {
+        self.expensive.finish(installed);
+        self.moderate.finish(installed);
+    }
+
+    pub(super) fn retire(&mut self, budget: &mut Budget) -> Result<(), ResourceError> {
+        let expensive = self.expensive.retire(budget);
+        let moderate = self.moderate.retire(budget);
+        super::super::kernel::select_cleanup([expensive, moderate])
+    }
+}
+
+impl<const CAPACITY: usize> ClockJudgments<CAPACITY> {
+    pub(super) fn new() -> Self {
+        const { assert!(CAPACITY.is_power_of_two() && CAPACITY < u16::MAX as usize) };
+        Self { ..Self::default() }
     }
     // Construction: entries is a dense occupied prefix, and every live entry
     // occurs once in its full-key hash chain. Encoded links are index+1, zero null.
@@ -129,7 +265,7 @@ impl Judgments {
             .copied()
             .ok_or(ResourceError::Invariant)?;
         let live = self.entries.len();
-        if live > SLOTS
+        if live > CAPACITY
             || usize::from(bucket.len) > live
             || (bucket.head == 0) != (bucket.len == 0)
             || usize::from(bucket.head) > live
@@ -143,7 +279,7 @@ impl Judgments {
     // known chain before reading entries; there are no per-iteration charges.
     fn find(&self, key: Key, budget: &mut Budget) -> Result<(u16, u16), ResourceError> {
         budget.charge_work(1)?;
-        if self.pending.is_some() || usize::from(self.hand) >= SLOTS {
+        if self.pending.is_some() || usize::from(self.hand) >= CAPACITY {
             return Err(ResourceError::Invariant);
         }
         let index = key.bucket();
@@ -205,12 +341,12 @@ impl Judgments {
     // Fixed headers/neighbours only. No flag read or credit consumption occurs
     // before all no-op eligibility/floor/duplicate checks have completed.
     fn prevalidate_headers(&self, new_bucket: u16) -> Result<Bucket, ResourceError> {
-        if self.entries.capacity() != SLOTS
+        if self.entries.capacity() != CAPACITY
             || self.buckets.capacity() != BUCKETS
             || self.buckets.len() != BUCKETS
-            || self.entries.len() > SLOTS
-            || usize::from(self.hand) >= SLOTS
-            || (self.entries.len() < SLOTS && self.hand != 0)
+            || self.entries.len() > CAPACITY
+            || usize::from(self.hand) >= CAPACITY
+            || (self.entries.len() < CAPACITY && self.hand != 0)
         {
             return Err(ResourceError::Invariant);
         }
@@ -226,7 +362,7 @@ impl Judgments {
     // Caller has set POISON, so any later error cannot reuse an uncleared span.
     fn skipped(&self, hand: usize) -> usize {
         let mut skip = 0;
-        while skip < SLOTS && self.entries[(hand + skip) & (SLOTS - 1)].visited {
+        while skip < CAPACITY && self.entries[(hand + skip) & (CAPACITY - 1)].visited {
             skip += 1;
         }
         skip
@@ -279,9 +415,21 @@ impl Judgments {
         work: u64,
         budget: &mut Budget,
     ) -> Result<(), ResourceError> {
+        self.prepare_at(key, work, self.floor(), budget)
+    }
+    fn floor(&self) -> u64 {
+        ADMISSION
+    }
+    fn prepare_at(
+        &mut self,
+        key: Option<Key>,
+        work: u64,
+        admission: u64,
+        budget: &mut Budget,
+    ) -> Result<(), ResourceError> {
         // Never silently replace an already funded outstanding span. The outer
         // State poisons every failed route before this owner can be called again.
-        if self.pending.is_some() || usize::from(self.hand) >= SLOTS {
+        if self.pending.is_some() || usize::from(self.hand) >= CAPACITY {
             self.pending = None;
             self.pending_skip = 0;
             self.pending_old_bucket = 0;
@@ -293,7 +441,6 @@ impl Judgments {
         // bucket fields are zero (new/finish/retire/error reset them together).
         // Thus every no-op retains all-zero pending metadata without hot stores.
         let Some(key) = key else { return Ok(()) };
-        let admission = ADMISSION;
         if work < admission {
             return Ok(());
         }
@@ -302,7 +449,7 @@ impl Judgments {
             return Ok(());
         }
         if self.buckets.is_empty() {
-            budget.grow_vec(&mut self.entries, SLOTS)?;
+            budget.grow_vec(&mut self.entries, CAPACITY)?;
             budget.grow_vec(&mut self.buckets, BUCKETS)?;
             budget.charge_work((BUCKETS + 2) as u64)?;
             self.buckets.resize(BUCKETS, Bucket::default());
@@ -310,18 +457,18 @@ impl Judgments {
         budget.charge_work(PUBLICATION_WORK)?;
         let next = self.prevalidate_headers(new_bucket)?;
         let saved_hand = self.hand;
-        let (skip, old_bucket) = if self.entries.len() == SLOTS {
+        let (skip, old_bucket) = if self.entries.len() == CAPACITY {
             // From this moment exactly one finish(true), or terminal poison and
             // flat retirement, must follow. No-op returns and retry are forbidden.
             self.hand = POISON;
             let skip = self.skipped(usize::from(saved_hand));
-            let victim = (usize::from(saved_hand) + skip) & (SLOTS - 1);
+            let victim = (usize::from(saved_hand) + skip) & (CAPACITY - 1);
             let link = (victim + 1) as u16;
             let old_bucket = self.entries[victim].key.bucket();
             self.validate_hash(link, old_bucket)?;
             // Header was already checked before the immutable scan; only hand
             // changed meanwhile. Reuse the copied header, not another validation.
-            if old_bucket != usize::from(new_bucket) && usize::from(next.len) >= SLOTS {
+            if old_bucket != usize::from(new_bucket) && usize::from(next.len) >= CAPACITY {
                 return Err(ResourceError::Invariant);
             }
             (skip as u16, old_bucket as u16)
@@ -349,12 +496,12 @@ impl Judgments {
             self.hand = POISON;
             return;
         }
-        let link = if self.entries.len() == SLOTS {
+        let link = if self.entries.len() == CAPACITY {
             let hand = usize::from(self.hand);
             for offset in 0..skip {
-                self.entries[(hand + offset) & (SLOTS - 1)].visited = false;
+                self.entries[(hand + offset) & (CAPACITY - 1)].visited = false;
             }
-            let victim = (hand + skip) & (SLOTS - 1);
+            let victim = (hand + skip) & (CAPACITY - 1);
             let link = (victim + 1) as u16;
             let entry = self.entries[victim];
             self.unlink_hash(old_bucket, entry);
@@ -364,7 +511,7 @@ impl Judgments {
                 hash_next: 0,
                 visited: false,
             };
-            self.hand = ((victim + 1) & (SLOTS - 1)) as u16;
+            self.hand = ((victim + 1) & (CAPACITY - 1)) as u16;
             link
         } else {
             self.entries.push(Entry {

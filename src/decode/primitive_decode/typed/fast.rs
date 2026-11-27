@@ -1,14 +1,13 @@
 //! Side-effect-free recognition of lean4export's canonical record layouts.
 //!
-//! The cursor is bounded by the logical record slice supplied by framing. Every
-//! successful recognizer consumes that slice exactly; no separator, padding,
-//! stale buffer byte, or following record can complete a match.
+//! Single-record recognition requires the exact end of the framed line.
+//! Application and binder runs recognize the same fields followed by LF inside a bounded
+//! chunk window. Numeric lookahead cannot consume the closing punctuation.
 
 use super::*;
 
 struct Cursor<'a> {
-    // Always a suffix of the exact logical record. No byte outside that record
-    // may satisfy a token; successful finish requires an empty suffix.
+    // Unconsumed suffix of the supplied record or physical read window.
     remaining: &'a [u8],
 }
 
@@ -46,6 +45,17 @@ impl<'a> Cursor<'a> {
         let mut at = 0;
         let value = if let Some(bytes) = input.get(..8) {
             let word = u64::from_le_bytes(bytes.try_into().ok()?);
+            // Large dense exports commonly use eight-digit references. A known
+            // full word needs neither a prefix count nor variable alignment.
+            let digits = word ^ 0x3030_3030_3030_3030;
+            if (digits | digits.wrapping_add(0x0606_0606_0606_0606)) & 0xf0f0_f0f0_f0f0_f0f0 == 0
+                && bytes[0] != b'0'
+                && !input.get(8).is_some_and(u8::is_ascii_digit)
+            {
+                let (raw, tail) = input.split_at(8);
+                self.remaining = tail;
+                return Some((Nat(raw), reduce_digits(digits) as u32));
+            }
             let (head, digits) = digits8(word);
             // digits8 validates the first byte as part of the exact prefix.
             // Empty prefixes fail before constructing a Nat or moving the cursor.
@@ -177,12 +187,16 @@ fn digits8(word: u64) -> (u64, usize) {
     let digits = word ^ 0x3030_3030_3030_3030;
     let non_digit = (digits | digits.wrapping_add(0x0606_0606_0606_0606)) & 0xf0f0_f0f0_f0f0_f0f0;
     let count = (non_digit.trailing_zeros() >> 3) as usize;
-    let mut value =
-        digits.wrapping_shl((64 - 8 * count) as u32) & ((count != 0) as u64).wrapping_neg();
+    let value = digits.wrapping_shl((64 - 8 * count) as u32) & ((count != 0) as u64).wrapping_neg();
+    (reduce_digits(value), count)
+}
+
+#[inline(always)]
+fn reduce_digits(mut value: u64) -> u64 {
     value = value.wrapping_mul(2561) >> 8;
     value = (value & 0x00ff_00ff_00ff_00ff).wrapping_mul(6_553_601) >> 16;
     value = (value & 0x0000_ffff_0000_ffff).wrapping_mul(42_949_672_960_001) >> 32;
-    (value, count)
+    value
 }
 
 #[inline(always)]
@@ -199,16 +213,58 @@ fn object<T>(fields: T) -> ObjectOnly<T> {
     ObjectOnly(fields)
 }
 
+// Shared grammar. The ordinary caller requires end of line; the run caller
+// requires a physical LF inside the current bounded read window.
+struct AppTokens<'a> {
+    function: (Nat<'a>, u32),
+    argument: (Nat<'a>, u32),
+    id: (Nat<'a>, u32),
+}
+impl<'a> Cursor<'a> {
+    #[inline(always)]
+    fn app_tokens(&mut self) -> Option<AppTokens<'a>> {
+        self.literal(br#"{"app":{"arg":"#)?;
+        let argument = self.natural_with_value()?;
+        self.literal(br#","fn":"#)?;
+        let function = self.natural_with_value()?;
+        self.literal(br#"},"ie":"#)?;
+        let id = self.natural_with_value()?;
+        self.literal(b"}")?;
+        Some(AppTokens {
+            function,
+            argument,
+            id,
+        })
+    }
+}
+
+pub(in crate::decode::primitive_decode) fn app_line(
+    input: &[u8],
+) -> Option<(usize, super::DenseApp)> {
+    let mut c = Cursor::new(input);
+    let fields = c.app_tokens()?;
+    c.literal(b"\n")?;
+    Some((
+        input.len() - c.remaining.len(),
+        super::DenseApp {
+            function: fields.function.1,
+            argument: fields.argument.1,
+            id: fields.id.1,
+        },
+    ))
+}
+
 #[inline(always)]
 fn app<'a, R>(input: &'a [u8], found: impl FnOnce(Plan<'a>) -> R) -> Option<R> {
     let mut c = Cursor::new(input);
-    c.literal(b"{\"app\":{\"arg\":")?;
-    let arg = c.reference()?;
-    c.literal(b",\"fn\":")?;
-    let function = c.reference()?;
-    c.literal(b"},\"ie\":")?;
-    let (id, id_number) = c.natural_with_value()?;
-    c.literal(b"}")?;
+    let fields = c.app_tokens()?;
+    let reference = |(raw, number)| Ref {
+        raw,
+        slot: Cell::new(RefState::Parsed(number)),
+    };
+    let function = reference(fields.function);
+    let arg = reference(fields.argument);
+    let (id, id_number) = fields.id;
     c.finish(
         Plan::Syntax {
             id,
@@ -222,23 +278,106 @@ fn app<'a, R>(input: &'a [u8], found: impl FnOnce(Plan<'a>) -> R) -> Option<R> {
     )
 }
 
+struct BinderTokens<'a> {
+    name: (Nat<'a>, u32),
+    ty: (Nat<'a>, u32),
+    body: (Nat<'a>, u32),
+    info: BinderInfo,
+}
+
+impl<'a> BinderTokens<'a> {
+    fn plan(self, pi: bool) -> SyntaxPlan<'a> {
+        let reference = |(raw, number)| Ref {
+            raw,
+            slot: Cell::new(RefState::Parsed(number)),
+        };
+        SyntaxPlan::Binder(
+            pi,
+            object(BinderFields {
+                f_name: reference(self.name),
+                f_type: reference(self.ty),
+                f_body: reference(self.body),
+                f_binder_info: Cow::Borrowed(match self.info {
+                    BinderInfo::Default => "default",
+                    BinderInfo::Implicit => "implicit",
+                    BinderInfo::StrictImplicit => "strictImplicit",
+                    BinderInfo::InstanceImplicit => "instImplicit",
+                }),
+            }),
+        )
+    }
+}
+
+#[inline(always)]
+fn binder_fields<'a>(c: &mut Cursor<'a>) -> Option<BinderTokens<'a>> {
+    // Matching the entire literal proves the UTF-8 binder spelling and the
+    // following JSON field delimiter together. Escapes use the ordinary parser.
+    let info = match c.byte()? {
+        b'd' => c
+            .literal(br#"default","body":"#)
+            .map(|()| BinderInfo::Default)?,
+        b's' => c
+            .literal(br#"strictImplicit","body":"#)
+            .map(|()| BinderInfo::StrictImplicit)?,
+        b'i' if c.remaining.get(1) == Some(&b'm') => c
+            .literal(br#"implicit","body":"#)
+            .map(|()| BinderInfo::Implicit)?,
+        b'i' => c
+            .literal(br#"instImplicit","body":"#)
+            .map(|()| BinderInfo::InstanceImplicit)?,
+        _ => return None,
+    };
+    let body = c.natural_with_value()?;
+    c.literal(b",\"name\":")?;
+    let name = c.natural_with_value()?;
+    c.literal(b",\"type\":")?;
+    let ty = c.natural_with_value()?;
+    Some(BinderTokens {
+        name,
+        ty,
+        body,
+        info,
+    })
+}
+
+pub(super) fn binder_line(input: &[u8]) -> Option<(usize, DenseBinder)> {
+    let mut c = Cursor::new(input);
+    let (fields, id, pi) = match input.get(2)? {
+        b'f' => {
+            c.literal(br#"{"forallE":{"binderInfo":""#)?;
+            let fields = binder_fields(&mut c)?;
+            c.literal(br#"},"ie":"#)?;
+            (fields, c.natural_with_value()?.1, true)
+        }
+        b'i' => {
+            c.literal(br#"{"ie":"#)?;
+            let id = c.natural_with_value()?.1;
+            c.literal(br#","lam":{"binderInfo":""#)?;
+            let fields = binder_fields(&mut c)?;
+            c.literal(b"}")?;
+            (fields, id, false)
+        }
+        _ => return None,
+    };
+    c.literal(b"}\n")?;
+    Some((
+        input.len() - c.remaining.len(),
+        DenseBinder {
+            id,
+            pi,
+            info: fields.info,
+            name: fields.name.1,
+            ty: fields.ty.1,
+            body: fields.body.1,
+        },
+    ))
+}
+
 #[inline(always)]
 fn pi<'a, R>(input: &'a [u8], found: impl FnOnce(Plan<'a>) -> R) -> Option<R> {
     let mut c = Cursor::new(input);
     c.literal(b"{\"forallE\":{\"binderInfo\":\"")?;
-    let binder_info = c.string()?;
-    if !matches!(
-        binder_info,
-        "default" | "implicit" | "strictImplicit" | "instImplicit"
-    ) {
-        return None;
-    }
-    c.literal(b",\"body\":")?;
-    let body = c.reference()?;
-    c.literal(b",\"name\":")?;
-    let name = c.reference()?;
-    c.literal(b",\"type\":")?;
-    let ty = c.reference()?;
+    let fields = binder_fields(&mut c)?;
     c.literal(b"},\"ie\":")?;
     let (id, id_number) = c.natural_with_value()?;
     c.literal(b"}")?;
@@ -246,15 +385,7 @@ fn pi<'a, R>(input: &'a [u8], found: impl FnOnce(Plan<'a>) -> R) -> Option<R> {
         Plan::Syntax {
             id,
             id_number: Some(id_number),
-            payload: SyntaxPlan::Binder(
-                true,
-                object(BinderFields {
-                    f_name: name,
-                    f_type: ty,
-                    f_body: body,
-                    f_binder_info: Cow::Borrowed(binder_info),
-                }),
-            ),
+            payload: fields.plan(true),
         },
         found,
     )
@@ -320,29 +451,9 @@ fn expression_id_first<'a, R>(input: &'a [u8], found: impl FnOnce(Plan<'a>) -> R
     let payload = if c.literal(b"sort\":").is_some() {
         SyntaxPlan::Sort(c.reference()?)
     } else if c.literal(b"lam\":{\"binderInfo\":\"").is_some() {
-        let binder_info = c.string()?;
-        if !matches!(
-            binder_info,
-            "default" | "implicit" | "strictImplicit" | "instImplicit"
-        ) {
-            return None;
-        }
-        c.literal(b",\"body\":")?;
-        let body = c.reference()?;
-        c.literal(b",\"name\":")?;
-        let name = c.reference()?;
-        c.literal(b",\"type\":")?;
-        let ty = c.reference()?;
+        let fields = binder_fields(&mut c)?;
         c.literal(b"}")?;
-        SyntaxPlan::Binder(
-            false,
-            object(BinderFields {
-                f_name: name,
-                f_type: ty,
-                f_body: body,
-                f_binder_info: Cow::Borrowed(binder_info),
-            }),
-        )
+        fields.plan(false)
     } else if c.literal(b"letE\":{\"body\":").is_some() {
         let body = c.reference()?;
         c.literal(b",\"name\":")?;

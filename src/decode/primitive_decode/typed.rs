@@ -1352,7 +1352,126 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
         d.deserialize_map(V(PhantomData))
     }
 }
+pub(super) struct DenseApp {
+    function: u32,
+    argument: u32,
+    id: u32,
+}
+
+pub(super) struct DenseBinder {
+    id: u32,
+    pi: bool,
+    name: u32,
+    ty: u32,
+    body: u32,
+    info: BinderInfo,
+}
+
 impl Decoder {
+    pub(super) fn dense_app(&self, window: &[u8]) -> Option<(usize, DenseApp)> {
+        let (len, app) = fast::app_line(window)?;
+        (self.expression_ids.next_dense(app.id) && app.function < app.id && app.argument < app.id)
+            .then_some((len, app))
+    }
+
+    pub(super) fn dense_binder(&self, window: &[u8]) -> Option<(usize, DenseBinder)> {
+        let (len, binder) = fast::binder_line(window)?;
+        (self.expression_ids.next_dense(binder.id)
+            && self.name_ids.in_prefix(binder.name)
+            && binder.ty < binder.id
+            && binder.body < binder.id)
+            .then_some((len, binder))
+    }
+
+    pub(super) fn publish_dense_binder(
+        &mut self,
+        binder: DenseBinder,
+        line: &[u8],
+        scratch: &mut Scratch,
+        b: &mut Budget,
+    ) -> Result<(), Failure> {
+        self.metadata_seen = false;
+        let reserved = reservation(line, b).map_err(resource)?;
+        scratch.universes.clear();
+        let result = (|| {
+            // Prefixes identify imported ordinals. Quotient initialization may
+            // insert physical names with no corresponding serialized ordinal.
+            b.observe(crate::resource::Event::TableLookups, 1);
+            let slot = self
+                .imported_name_slot(binder.name)
+                .map_err(Cause::Resource)?;
+            for _ in 0..3 {
+                b.observe(crate::resource::Event::TableLookups, 1);
+            }
+            let name = self.names.resolve_slot(slot, b).map_err(Cause::Resource)?;
+            let ty = self
+                .expressions
+                .resolve_slot(binder.ty, b)
+                .map_err(Cause::Resource)?;
+            let body = self
+                .expressions
+                .resolve_slot(binder.body, b)
+                .map_err(Cause::Resource)?;
+            let kind = if binder.pi {
+                ExprKind::Pi(name, ty, body, binder.info)
+            } else {
+                ExprKind::Lambda(name, ty, body, binder.info)
+            };
+            let slot = self
+                .expressions
+                .append(kind, &self.levels, &self.names, b)
+                .map_err(expression_error)?;
+            self.expression_ids
+                .insert_dense(binder.id, slot.slot())
+                .map_err(index_error)
+        })();
+        let result = result.map_err(|cause| match cause {
+            Cause::Resource(e) => resource(e),
+            other => integrity::failure(line, Some(self), other, b),
+        });
+        b.release(reserved).map_err(resource).and(result)
+    }
+
+    /// dense_app proved both references exist and that this ID is fresh.
+    /// No intervening record can modify the index between recognition and commit.
+    pub(super) fn publish_dense_app(
+        &mut self,
+        app: DenseApp,
+        line: &[u8],
+        scratch: &mut Scratch,
+        b: &mut Budget,
+    ) -> Result<(), Failure> {
+        self.metadata_seen = false;
+        let reserved = reservation(line, b).map_err(resource)?;
+        scratch.universes.clear();
+        // fn, arg, then own-ID duplicate check, as in the normal publisher.
+        for _ in 0..3 {
+            b.observe(crate::resource::Event::TableLookups, 1);
+        }
+        let result = (|| {
+            let f = self
+                .expressions
+                .resolve_slot(app.function, b)
+                .map_err(Cause::Resource)?;
+            let a = self
+                .expressions
+                .resolve_slot(app.argument, b)
+                .map_err(Cause::Resource)?;
+            let slot = self
+                .expressions
+                .append_application(f, a, b)
+                .map_err(expression_error)?;
+            self.expression_ids
+                .insert_dense(app.id, slot.slot())
+                .map_err(index_error)
+        })();
+        let result = result.map_err(|cause| match cause {
+            Cause::Resource(e) => resource(e),
+            other => integrity::failure(line, Some(self), other, b),
+        });
+        b.release(reserved).map_err(resource).and(result)
+    }
+
     pub(super) fn typed_decode(
         &mut self,
         input: &[u8],

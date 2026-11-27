@@ -110,6 +110,59 @@ impl<'r, 'd, R: Read, E: Copy> Stream<'r, 'd, R, E> {
         };
         std::num::NonZeroU64::new(record)
     }
+    /// Production and decoder-bench ignore syntax callbacks. Consume only
+    /// eligible applications and binders here; every other record still reaches next().
+    pub(crate) fn next_ignoring_syntax(
+        &mut self,
+        b: &mut Budget,
+        consume: impl FnOnce(Item<'_>, &mut Decoder, &mut Budget) -> Result<(), E>,
+    ) -> Result<Next<()>, Failure<E>> {
+        if self.header.is_some()
+            && self.failure.is_none()
+            && self.decoder.failure.is_none()
+            && !self.ended
+        {
+            let result = self.consume_dense_syntax(b);
+            if let Err(error) = result {
+                self.failure = Some(error);
+                return Err(error);
+            }
+        }
+        self.next(b, |item, decoder, budget| match item {
+            Item::Syntax(_) => Ok(()),
+            other => consume(other, decoder, budget),
+        })
+    }
+
+    fn consume_dense_syntax(&mut self, b: &mut Budget) -> Result<(), Failure<E>> {
+        loop {
+            let window = self.framer.window();
+            let published = if let Some((take, app)) = self.decoder.dense_app(window) {
+                let line = self.framer.admit_line(take, b).map_err(Failure::Framing)?;
+                self.decoder
+                    .publish_dense_app(app, line, &mut self.body_scratch, b)
+            } else if let Some((take, binder)) = self.decoder.dense_binder(window) {
+                let line = self.framer.admit_line(take, b).map_err(Failure::Framing)?;
+                self.decoder
+                    .publish_dense_binder(binder, line, &mut self.body_scratch, b)
+            } else {
+                break;
+            };
+            if let Err(failure) = published {
+                self.decoder.failure = Some(failure);
+                return Err(Failure::Record {
+                    failure,
+                    repeated_metadata: false,
+                });
+            }
+            self.decoded_records = self.decoded_records.checked_add(1).ok_or(Failure::Framing(
+                FrameError::Resource(ResourceError::Counter),
+            ))?;
+            b.decoded_records(self.decoded_records);
+        }
+        Ok(())
+    }
+
     /// The callback runs only after complete record grammar, field and reference
     /// validation. Declaration semantic checking/installation are its obligations.
     /// A semantic rejection may be returned as T so the owner can keep structurally

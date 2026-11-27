@@ -4,9 +4,7 @@
 use super::*;
 use crate::check::environment::{Safety, StoredKind, TypeSource};
 use crate::syntax::levels::{Instance, LevelId};
-use std::hash::{Hash, Hasher};
 mod expanded;
-mod key;
 mod matching;
 mod naming;
 mod parameters;
@@ -35,28 +33,25 @@ struct Constructor {
 #[derive(Clone, Copy)]
 struct Key {
     root: ExprId,
-    start: u32,
-    len: u32,
-    hash: u64,
+    hash: u32,
 }
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Family>() == 24);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Constructor>() == 12);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Key>() == 24);
+const _: () = assert!(size_of::<Key>() == 8);
 
 #[derive(Default)]
 pub(super) struct Queue {
     families: Vec<Family>,
     constructors: Vec<Constructor>,
     keys: Vec<Key>,
-    bytes: Vec<u8>,
     next_name: u32,
     original_constructors: Vec<ExprId>,
 }
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Queue>() == 128);
+const _: () = assert!(size_of::<Queue>() == 104);
 fn push<T: crate::resource::charged::Charged>(
     v: &mut Vec<T>,
     x: T,
@@ -204,7 +199,7 @@ impl Queue {
                 cursor += 1;
             }
             self.rewrite_constructors(request, order, &parameters, work, environment, before)?;
-            // Discovery/rewrite bytes are never reused after this boundary.
+            // Discovery/rewrite fingerprints are never reused after this boundary.
             // Close saved representatives before their canonical locals retire;
             // subsequent restoration consumes these lambda recipes as syntax.
             if first.num_params != 0 {
@@ -457,63 +452,41 @@ impl Queue {
                 return Ok(Some(i));
             }
         }
-        let mut bytes = Vec::new();
-        let result = (|| {
-            key::encode(root, &mut bytes, work)?;
-            let mut h = crate::syntax::hash::FastHasher::new();
-            bytes.hash(&mut h);
-            let hash = h.finish();
-            for (i, k) in self.keys.iter().enumerate() {
-                work.budget.charge_work(1)?;
-                if k.hash == hash && k.len as usize == bytes.len() {
-                    work.budget.charge_work(bytes.len() as u64)?;
-                    if self
-                        .bytes
-                        .get(
-                            k.start as usize
-                                ..k.start.checked_add(k.len).ok_or(ResourceError::Counter)?
-                                    as usize,
-                        )
-                        .ok_or(ResourceError::Invariant)?
-                        == bytes
-                    {
-                        return Ok(Some(i));
-                    }
-                }
+        let hash = work
+            .expressions
+            .get(root, work.budget)?
+            .syntax_fingerprint();
+        for (i, key) in self.keys.iter().enumerate() {
+            work.budget.charge_work(1)?;
+            // Discovery owns both live roots. A fingerprint match alone cannot
+            // equate keys, even when both roots were generated in this session.
+            if key.hash == hash
+                && crate::check::environment::validation::schema_match::nested_key(
+                    work, key.root, root,
+                )?
+            {
+                return Ok(Some(i));
             }
-            Ok(None)
-        })();
-        release(bytes, work.budget)?;
-        result
+        }
+        Ok(None)
     }
     fn save(&mut self, root: ExprId, work: &mut Working<'_>) -> Result<u32, Stop> {
-        let start = self.bytes.len();
-        key::encode(root, &mut self.bytes, work)?;
-        let mut h = crate::syntax::hash::FastHasher::new();
-        self.bytes[start..].hash(&mut h);
+        let hash = work
+            .expressions
+            .get(root, work.budget)?
+            .syntax_fingerprint();
         let index = u32::try_from(self.keys.len()).map_err(|_| ResourceError::Counter)?;
-        push(
-            &mut self.keys,
-            Key {
-                root,
-                start: u32::try_from(start).map_err(|_| ResourceError::Counter)?,
-                len: u32::try_from(self.bytes.len() - start).map_err(|_| ResourceError::Counter)?,
-                hash: h.finish(),
-            },
-            work.budget,
-        )?;
+        push(&mut self.keys, Key { root, hash }, work.budget)?;
         Ok(index)
     }
     pub(super) fn retire(self, b: &mut Budget) -> Result<(), ResourceError> {
         let a = release(self.families, b);
         let z = release(self.constructors, b);
         let k = release(self.keys, b);
-        let v = release(self.bytes, b);
         let r = release(self.original_constructors, b);
         a?;
         z?;
         k?;
-        v?;
         r
     }
 }
@@ -633,6 +606,46 @@ fn children(root: ExprId, work: &mut Working<'_>) -> Result<[Option<ExprId>; 3],
     )
 }
 
+impl Queue {
+    /// Once the queue has completed, the public auxiliary recursor
+    /// names `First.rec_1` … are fixed. One already held by a committed
+    /// constant makes the block a duplicate declaration. Only the committed
+    /// prefix (`before`) is consulted; collisions with the block's own members
+    /// keep the restoration decline.
+    ///
+    /// Invariant: for every block Lean admits,
+    /// `self.families` has exactly Lean's `numNested` helpers in Lean's order.
+    /// The probed names are then exactly those Lean creates. Membership
+    /// validation runs later, so it cannot catch a count mismatch first.
+    pub(super) fn committed_public_recursor(
+        &self,
+        request: &Request<'_>,
+        order: &Order,
+        work: &mut Working<'_>,
+        environment: &Environment,
+        before: usize,
+    ) -> Result<bool, Stop> {
+        let first = request
+            .types
+            .get(*order.families.first().ok_or(ResourceError::Invariant)? as usize)
+            .ok_or(ResourceError::Invariant)?;
+        for index in 0..self.families.len() {
+            let ordinal = u32::try_from(index)
+                .map_err(|_| ResourceError::Counter)?
+                .checked_add(1)
+                .ok_or(ResourceError::Counter)?;
+            let public = restore::public_recursor(first.name, ordinal, work)?;
+            if environment
+                .lookup(public, before, work.names, work.budget)?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 // Failed retirement is terminal. Preserve every primary cause separately from
 // cleanup so an exhausted leave cannot turn an internal failure into a decline.
 fn finish_parameters(
@@ -649,7 +662,7 @@ fn finish_parameters(
 
 // Charged sizes (64-bit layout) of this module's stored types.
 crate::resource::charged::charged! {
-    Key => 24,
+    Key => 8,
     Constructor => 12,
     Family => 24,
 }

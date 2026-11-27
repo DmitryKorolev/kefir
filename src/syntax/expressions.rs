@@ -110,7 +110,6 @@ struct RawExpression {
     // Pi/lambda and let labels are omitted; raw descriptors retain them. Neither a
     // match nor a mismatch establishes conversion equality or inequality.
     fingerprint: u32,
-    loose: u32,
 }
 
 // Transient constructor arguments only; never retained with a node or handle.
@@ -121,7 +120,7 @@ struct AppendFacts {
     depth: u32,
     flags: u32,
     fields: [u32; 3],
-    loose: u32,
+    reads: BoundReads,
     hash_fields: [u32; 3],
 }
 
@@ -140,7 +139,7 @@ pub(crate) struct Expression<'a> {
 // bound leaves bit 31 free; bits 4..7 are also unused in the raw header. Tiny
 // third operands live there (binder bodies use an exact short backward gap),
 // otherwise they index a block-local escape array.
-// Clearing STORED_BITS reconstructs every original descriptor bit exactly.
+// raw_descriptor removes the packed operand bits and decodes the logical depth.
 const STORED_ESCAPE: u32 = 1 << 31;
 const STORED_ORDINAL_SHIFT: u32 = 4;
 const STORED_ORDINAL_MASK: u32 = 15 << STORED_ORDINAL_SHIFT;
@@ -158,9 +157,62 @@ struct StoredExpression {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<StoredExpression>() == 20);
 
+// The depth field has 17 bits and valid depths end at 65536. Keep the
+// top two valid depths in range-only mode. For smaller depths there are
+// enough unused codes for both representations, without an extra row byte.
+const RANGE_ONLY_DEPTH: u32 = 65535;
+const WIDE_DEPTH_OFFSET: u32 = 65537;
+const _: () = assert!(STRUCTURE_DEPTH == RANGE_ONLY_DEPTH + 1);
+
+#[derive(Clone, Copy)]
+enum BoundReads {
+    Mask(u32),
+    Range(u32),
+}
+
+impl BoundReads {
+    fn range(self) -> u32 {
+        match self {
+            Self::Mask(bits) => u32::BITS - bits.leading_zeros(),
+            Self::Range(range) => range,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Mask(a), Self::Mask(b)) => Self::Mask(a | b),
+            (a, b) => Self::Range(a.range().max(b.range())),
+        }
+    }
+
+    fn under_binder(self) -> Self {
+        match self {
+            Self::Mask(bits) => Self::Mask(bits >> 1),
+            Self::Range(range) => Self::Range(range.saturating_sub(1)),
+        }
+    }
+}
+
 impl StoredExpression {
-    fn depth(&self) -> u32 {
+    fn stored_depth(self) -> u32 {
         (self.header & !STORED_ESCAPE) >> DEPTH_SHIFT
+    }
+
+    fn depth(&self) -> u32 {
+        let code = self.stored_depth();
+        if code >= WIDE_DEPTH_OFFSET {
+            code - WIDE_DEPTH_OFFSET
+        } else {
+            code
+        }
+    }
+
+    fn reads(self) -> BoundReads {
+        if self.stored_depth() >= RANGE_ONLY_DEPTH {
+            BoundReads::Range(self.loose)
+        } else {
+            BoundReads::Mask(self.loose)
+        }
     }
     fn flags(&self) -> u32 {
         (self.header >> FLAGS_SHIFT) & FLAGS_MASK
@@ -247,7 +299,8 @@ impl Expression<'_> {
     }
     fn raw_descriptor(self, expressions: &Expressions) -> Result<Descriptor, ResourceError> {
         Ok(Descriptor {
-            header: self.stored.header & !STORED_BITS,
+            header: (self.stored.header & !STORED_BITS & ((1 << DEPTH_SHIFT) - 1))
+                | (self.stored.depth() << DEPTH_SHIFT),
             fields: [
                 self.stored.fields[0],
                 self.stored.fields[1],
@@ -271,7 +324,25 @@ impl Expression<'_> {
         self.stored.fingerprint
     }
     pub(crate) fn loose_range(self) -> u32 {
-        self.stored.loose
+        self.stored.reads().range()
+    }
+    /// Conservative local binding positions for this immutable source row.
+    /// Universe instances, free locals and graph provenance have separate scope.
+    pub(crate) fn binding_mask(self) -> Option<u32> {
+        match self.stored.reads() {
+            BoundReads::Mask(bits) => Some(bits),
+            BoundReads::Range(_) => None,
+        }
+    }
+    /// For the support relation shared with inference, Free and metadata
+    /// retain their existing conservative treatment. An exact short mask
+    /// cannot have passed through an out-of-range child.
+    pub(crate) fn plain_binding_mask(self) -> Option<u32> {
+        if self.flags() & (FREE | META) == 0 {
+            self.binding_mask()
+        } else {
+            None
+        }
     }
     /// Equivalent to raw_kind's tag-zero arm, for this exact borrowed row.
     /// Reads no derived scope fact and creates no cache/checkedness authority.
@@ -283,6 +354,17 @@ impl Expression<'_> {
     #[inline(always)]
     pub(crate) fn is_application(self) -> bool {
         self.tag() == 3
+    }
+    /// Read the two inline operands when walking an application spine.
+    /// A non-application is decoded by kind() at the head of the spine.
+    #[inline]
+    pub(crate) fn application_operands(self, budget: &mut Budget) -> Option<(ExprId, ExprId)> {
+        if !self.is_application() {
+            return None;
+        }
+        budget.observe(crate::resource::Event::TableLookups, 1);
+        let [function, argument] = self.stored.fields;
+        Some((ExprId(function), ExprId(argument)))
     }
     pub(crate) fn has_free(self) -> bool {
         self.flags() & FREE != 0
@@ -613,6 +695,7 @@ impl Expressions {
     fn plan_node(
         &mut self,
         expression: RawExpression,
+        reads: BoundReads,
         budget: &mut Budget,
     ) -> Result<NodePlan, ResourceError> {
         // Only completed raw descriptors enter here; their actual bounded
@@ -656,7 +739,14 @@ impl Expressions {
         } else {
             inline.ok_or(ResourceError::Invariant)?
         };
-        let header = expression.descriptor.header
+        let depth = expression.descriptor.header >> DEPTH_SHIFT;
+        let (depth_code, loose) = match reads {
+            BoundReads::Mask(bits) if depth < RANGE_ONLY_DEPTH => (depth, bits),
+            _ if depth < RANGE_ONLY_DEPTH => (depth + WIDE_DEPTH_OFFSET, reads.range()),
+            _ => (depth, reads.range()),
+        };
+        let header = (expression.descriptor.header & ((1 << DEPTH_SHIFT) - 1))
+            | (depth_code << DEPTH_SHIFT)
             | (ordinal << STORED_ORDINAL_SHIFT)
             | if escape { STORED_ESCAPE } else { 0 };
         // The budget helper has no charges/events when capacity suffices.
@@ -684,7 +774,7 @@ impl Expressions {
                     expression.descriptor.fields[1],
                 ],
                 fingerprint: expression.fingerprint,
-                loose: expression.loose,
+                loose,
             },
             block_base: first.then_some(base),
             extra: escape.then_some(third),
@@ -757,7 +847,7 @@ impl Expressions {
                 depth,
                 flags: x.flags() | y.flags(),
                 fields: [a.0, b.0, 0],
-                loose: x.loose.max(y.loose),
+                reads: x.reads().union(y.reads()),
                 hash_fields: [x.fingerprint, y.fingerprint, 0],
             },
             budget,
@@ -781,12 +871,18 @@ impl Expressions {
         // Whole-span work is charged before scans, hashing or copying. All stores
         // keep their logical lengths until every required allocation succeeds.
         let mut literal: &[u8] = &[];
-        let (depth, loose, flags, hash_fields) = match kind {
+        let (depth, reads, flags, hash_fields) = match kind {
             ExprKind::Bound(index) => {
                 fields[0] = index;
                 (
                     0,
-                    index.checked_add(1).ok_or(ExpressionError::NumericRange)?,
+                    if index < 32 {
+                        BoundReads::Mask(1 << index)
+                    } else {
+                        BoundReads::Range(
+                            index.checked_add(1).ok_or(ExpressionError::NumericRange)?,
+                        )
+                    },
                     0,
                     [index, 0, 0],
                 )
@@ -794,7 +890,7 @@ impl Expressions {
             ExprKind::Free(id) => {
                 tag = 1;
                 fields[0] = id;
-                (0, 0, FREE, [id, 0, 0])
+                (0, BoundReads::Mask(0), FREE, [id, 0, 0])
             }
             ExprKind::Sort(id) => {
                 let level = levels.get(id, budget)?;
@@ -802,7 +898,7 @@ impl Expressions {
                 fields[0] = id.slot();
                 (
                     level.depth(),
-                    0,
+                    BoundReads::Mask(0),
                     if level.has_param() { PARAM } else { 0 },
                     [level.structural_hash(), 0, 0],
                 )
@@ -827,7 +923,7 @@ impl Expressions {
                         .depth
                         .max(domain_node.depth())
                         .max(body_node.depth()),
-                    domain_node.loose.max(body_node.loose.saturating_sub(1)),
+                    domain_node.reads().union(body_node.reads().under_binder()),
                     domain_node.flags() | body_node.flags(),
                     [0, domain_node.fingerprint, body_node.fingerprint],
                 )
@@ -848,7 +944,12 @@ impl Expressions {
                     flags |= if l.has_param() { PARAM } else { 0 };
                     hash = mix(hash, l.structural_hash());
                 }
-                (depth, 0, flags, [n.canonical, count, hash])
+                (
+                    depth,
+                    BoundReads::Mask(0),
+                    flags,
+                    [n.canonical, count, hash],
+                )
             }
             ExprKind::Let(name, ty, value, body, nondep) => {
                 let n = names.summary(name, budget)?;
@@ -862,7 +963,7 @@ impl Expressions {
                     u32::try_from(self.lets.len()).map_err(|_| ExpressionError::NumericRange)?;
                 (
                     n.depth.max(t.depth()).max(v.depth()).max(r.depth()),
-                    t.loose.max(v.loose).max(r.loose.saturating_sub(1)),
+                    t.reads().union(v.reads()).union(r.reads().under_binder()),
                     t.flags() | v.flags() | r.flags(),
                     [
                         // Let display names are irrelevant to C1 identity. Retain
@@ -880,7 +981,7 @@ impl Expressions {
                 fields = [name.0, index, target.0];
                 (
                     n.depth.max(t.depth()),
-                    t.loose,
+                    t.reads(),
                     t.flags(),
                     [n.canonical, index, t.fingerprint],
                 )
@@ -909,7 +1010,7 @@ impl Expressions {
                 let hash = literal
                     .iter()
                     .fold(0, |hash, byte| mix(hash, u32::from(*byte)));
-                (0, 0, 0, [count, hash, 0])
+                (0, BoundReads::Mask(0), 0, [count, hash, 0])
             }
             ExprKind::MData(payload, wrapped) => {
                 // The payload is already a validated JSON object when it
@@ -930,7 +1031,7 @@ impl Expressions {
                     .fold(0, |hash, byte| mix(hash, u32::from(*byte)));
                 (
                     child.depth(),
-                    child.loose,
+                    child.reads(),
                     child.flags() | META,
                     [child.fingerprint, count, hash],
                 )
@@ -951,7 +1052,7 @@ impl Expressions {
                 depth,
                 flags,
                 fields,
-                loose,
+                reads,
                 hash_fields,
             },
             budget,
@@ -1006,7 +1107,7 @@ impl Expressions {
             depth,
             flags,
             fields,
-            loose,
+            reads,
             hash_fields,
         } = facts;
         if crate::resource::traced!("expressions.limit", (depth, STRUCTURE_DEPTH), {
@@ -1030,8 +1131,8 @@ impl Expressions {
             RawExpression {
                 descriptor: Descriptor::new(tag, binder, depth, flags, fields),
                 fingerprint: hash,
-                loose,
             },
+            reads,
             budget,
         )?;
         Ok((slot, plan))
@@ -1082,8 +1183,8 @@ impl Expressions {
                     [wrapped.0, payload.0, payload.1],
                 ),
                 fingerprint: hash,
-                loose: child.loose,
             },
+            child.reads(),
             budget,
         )?;
         self.publish_node(plan);

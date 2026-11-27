@@ -24,14 +24,14 @@ mod unsafe_candidate;
 pub(crate) struct State {
     environment: Environment,
     retention: super::kernel::Retention,
-    theorem_judgments: theorem_judgments::Judgments,
+    theorem_judgments: theorem_judgments::RootCaches,
     axioms: Axioms,
     checked: u64,
     failure: Option<FailureReport>,
 }
 // Declaration entries remain unchanged.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<State>() == 968 + size_of::<theorem_judgments::Judgments>());
+const _: () = assert!(size_of::<State>() == 1064 + size_of::<theorem_judgments::RootCaches>());
 fn unsupported() -> FailureReport {
     FailureReport {
         outcome: FailureOutcome::Decline,
@@ -71,7 +71,10 @@ fn capture_ordinary(
         )
         | Stop::Scope(_) => &[Rule::DeclarationPolicy],
         Stop::Judgment(
-            Negative::MissingConstant | Negative::UnsafeReference | Negative::InvalidProjection,
+            Negative::MissingConstant
+            | Negative::UnsafeReference
+            | Negative::UniverseArity
+            | Negative::InvalidProjection,
         )
         | Stop::Inference(_) => &[Rule::Inference],
         Stop::Normalization(HeadError::Unsupported) | Stop::Observation(HeadError::Unsupported) => {
@@ -191,7 +194,7 @@ impl State {
         Ok(Self {
             environment: Environment::default(),
             retention: super::kernel::Retention::default(),
-            theorem_judgments: theorem_judgments::Judgments::new(),
+            theorem_judgments: theorem_judgments::RootCaches::new(),
             axioms: Axioms::default(),
             checked: 0,
             failure: None,
@@ -309,8 +312,9 @@ impl State {
         };
         // Original decoded roots only. This State is paired with the stream's
         // single Decoder throughout; generated/staged requests never enter here.
-        let theorem_key = self.theorem_judgments.key(request, axiom_policy);
-        let theorem_work_before = budget.snapshot().work_charged;
+        let root_key = self.theorem_judgments.key(request, axiom_policy);
+        let mut producer_key = root_key;
+        let root_work_before = budget.snapshot().work_charged;
         let witness = |work: &mut Working<'_>, bound_naturals| {
             super::kernel::different_theorem(
                 &self.environment,
@@ -395,19 +399,30 @@ impl State {
             let result = (|| {
                 // The decoded roots themselves, before any route
                 // copies or evaluates them.
+                let kernel_scope = scope();
+                let eligible = super::kernel::eligible(request, &kernel_scope);
+                if eligible
+                    && self
+                        .theorem_judgments
+                        .completed_definition_scope(root_key, &self.environment, work.budget)
+                        .map_err(Stop::Resource)?
+                {
+                    producer_key = None;
+                    return Ok(());
+                }
                 let originals = [request.ty, request.value.unwrap_or(request.ty)];
                 work.check_input_scope(request.parameters, &originals)?;
                 // Isolated value-kernel trial: a completed positive check
                 // replaces the ordinary route; anything else falls through
                 // to it unchanged. Mandatory resource errors stay terminal.
-                let kernel_scope = scope();
-                if super::kernel::eligible(request, &kernel_scope) {
+                if eligible {
                     if self
                         .theorem_judgments
-                        .lookup(theorem_key, work.budget)
+                        .lookup(root_key, &self.environment, work.budget)
                         .map_err(Stop::Resource)?
                     {
-                        // Only repeated T : Prop and p : T are discharged.
+                        producer_key = None; // a reused judgment is never a new producer
+                        // Only the repeated typing obligations of this same kind are discharged.
                         // Session cleanup and all publication checks below
                         // remain mandatory. Admitted axioms are monotonic
                         // in this State, collected at every axiom install.
@@ -467,12 +482,12 @@ impl State {
         if formation_negative.is_some() {
             return Ok(Admission::TypeMismatch);
         }
-        let theorem_work = budget
+        let root_work = budget
             .snapshot()
             .work_charged
-            .saturating_sub(theorem_work_before);
+            .saturating_sub(root_work_before);
         self.theorem_judgments
-            .prepare(theorem_key, theorem_work, budget)
+            .prepare(producer_key, root_work, self.environment.len(), budget)
             .map_err(ResourceError::failure_report)?;
         // Original fields only. All generated syntax/locals/cache retirement
         // succeeded before publication; no fallible check follows insertion.

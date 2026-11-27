@@ -250,6 +250,16 @@ impl State {
                     (expression_end, level_end),
                 )
                 .and_then(|()| {
+                    if queue.committed_public_recursor(
+                        request,
+                        &order,
+                        work,
+                        &self.environment,
+                        before,
+                    )? {
+                        *duplicate = true;
+                        return Ok(());
+                    }
                     queue.check_expanded_types(
                         request,
                         &order,

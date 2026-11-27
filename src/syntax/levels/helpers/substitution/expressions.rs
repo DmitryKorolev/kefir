@@ -56,7 +56,8 @@ impl Expressions {
     }
 
     /// Template construction: reconstruct each parameter-dependent
-    /// occurrence independently in both stores; preserve exact replacement leaves.
+    /// expression occurrence and every surviving fresh level independently.
+    /// A level result that predates this operation may be returned again.
     /// The caller validates an immutable owned template frontier, including any
     /// generated pool's phase and lifetime. This operation does not grant typing
     /// authority or permit relabeling generated roots as imported templates.

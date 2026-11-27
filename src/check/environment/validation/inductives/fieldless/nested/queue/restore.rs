@@ -301,7 +301,11 @@ fn name_error(error: crate::syntax::names::NameError) -> Stop {
         _ => ResourceError::Invariant.into(),
     }
 }
-fn public_recursor(first: NameId, mut index: u32, work: &mut Working<'_>) -> Result<NameId, Stop> {
+pub(super) fn public_recursor(
+    first: NameId,
+    mut index: u32,
+    work: &mut Working<'_>,
+) -> Result<NameId, Stop> {
     let mut text = [0u8; 14];
     let mut start = text.len();
     loop {
