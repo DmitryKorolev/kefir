@@ -241,30 +241,33 @@ pub(super) fn derive(
             formation: Some(phase),
             ..scope
         };
-        let mut offset = 0usize;
-        for (member, &Recursor { name: recursor, .. }) in output.types.iter().enumerate() {
-            let family = expanded.family(member)?;
-            for index in 0..family.constructors {
-                let constructor = expanded.constructor(member, index, work)?;
-                let rhs = scratch.rhs(work, recursor, offset)?;
-                work.check_root_scope(parameters, &[rhs])?;
-                scratch.recheck(work, rhs, offset, scope, environment)?;
-                let ty = scratch.rule_type(work, offset)?;
-                work.check_root_scope(parameters, &[ty])?;
-                work.check_type(ty, false, ReductionPath::start(), scope, environment)?;
-                push(
-                    &mut output.rules,
-                    Rule {
-                        constructor: constructor.name,
-                        fields: scratch.field_count(offset)?,
-                        rhs,
-                        ty,
-                    },
-                    work.budget,
-                )?;
-                offset = offset.checked_add(1).ok_or(ResourceError::Counter)?;
+        scratch.with_rule_domains(work, |work, rules| {
+            let mut offset = 0usize;
+            for (member, &Recursor { name: recursor, .. }) in output.types.iter().enumerate() {
+                let family = expanded.family(member)?;
+                for index in 0..family.constructors {
+                    let constructor = expanded.constructor(member, index, work)?;
+                    let rhs = rules.rhs(work, recursor, offset)?;
+                    work.check_root_scope(parameters, &[rhs])?;
+                    scratch.recheck(work, rhs, offset, scope, environment)?;
+                    let ty = rules.rule_type(work, offset)?;
+                    work.check_root_scope(parameters, &[ty])?;
+                    work.check_type(ty, false, ReductionPath::start(), scope, environment)?;
+                    push(
+                        &mut output.rules,
+                        Rule {
+                            constructor: constructor.name,
+                            fields: scratch.field_count(offset)?,
+                            rhs,
+                            ty,
+                        },
+                        work.budget,
+                    )?;
+                    offset = offset.checked_add(1).ok_or(ResourceError::Counter)?;
+                }
             }
-        }
+            Ok(())
+        })?;
         output.phase = Some(phase);
         // Retained roots are still private. Exact restoration, restored type and
         // computation matching, and atomic public admission remain separate work.

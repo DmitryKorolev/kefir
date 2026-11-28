@@ -1,7 +1,7 @@
 //! Checked functional-recursive specialization. All handles are owner-local.
 use super::*;
 use crate::check::environment::CheckednessMint;
-use crate::syntax::expressions::binding::Binding;
+use crate::syntax::expressions::binding::{Abstraction, Binding};
 use crate::syntax::levels::{LevelId, LevelZero};
 use crate::syntax::local_context::{CheckedTy, FreeId};
 mod opened_telescope;
@@ -113,8 +113,8 @@ fn substitute(work: &mut Working<'_>, body: ExprId, replacement: ExprId) -> Resu
 }
 fn binder(work: &mut Working<'_>, ty: ExprId, path: ReductionPath) -> Result<Binder, Stop> {
     let id = work.context.enter_checked(
-        // Certificate authority: scheme construction operates on types the
-        // ordinary field-classification rules checked in this same scope.
+        // Every caller has formation in this scope, from a type check or
+        // inversion of a checked telescope opened with exact-domain locals.
         CheckedTy::checked(ty, CheckednessMint::mint()),
         None,
         NameId::ANONYMOUS,
@@ -138,7 +138,7 @@ fn close(
     binders: &[Binder],
     lambda: bool,
 ) -> Result<ExprId, Stop> {
-    close_by(work, body, binders.len(), |k| binders[k], lambda)
+    close_by(work, body, binders.len(), |k| binders[k], lambda, &[])
 }
 /// Closes `body` over the telescope `binder(0..n)`, outermost first, with one
 /// abstraction pass over the body and one over each binder type that has free
@@ -154,6 +154,7 @@ fn close_by(
     n: usize,
     binder: impl Fn(usize) -> Binder,
     lambda: bool,
+    shared: &[ExprId],
 ) -> Result<ExprId, Stop> {
     if n == 0 {
         return Ok(body);
@@ -162,26 +163,21 @@ fn close_by(
     work.budget.grow_vec(&mut ids, n)?;
     ids.extend((0..n).rev().map(|k| binder(k).id.slot()));
     let result = (|| {
+        let positions = Abstraction::new(&ids, work.budget)?;
         body = work.expressions.bind(
             body,
             0,
-            Binding::Abstract(&ids),
+            positions.suffix(0)?,
             work.levels,
             work.names,
             work.budget,
         )?;
         for k in (0..n).rev() {
-            let mut ty = binder(k).generated_ty;
-            if k != 0 && work.expressions.get(ty, work.budget)?.has_free() {
-                ty = work.expressions.bind(
-                    ty,
-                    0,
-                    Binding::Abstract(&ids[n - k..]),
-                    work.levels,
-                    work.names,
-                    work.budget,
-                )?;
-            }
+            let ty = if let Some(&domain) = shared.get(k) {
+                domain
+            } else {
+                close_domain(work, binder(k), &positions, n, k)?
+            };
             body = append(
                 work,
                 if lambda {
@@ -198,6 +194,27 @@ fn close_by(
     work.budget.release(bytes as u64)?;
     result
 }
+fn close_domain(
+    work: &mut Working<'_>,
+    binder: Binder,
+    positions: &Abstraction<'_>,
+    n: usize,
+    k: usize,
+) -> Result<ExprId, Stop> {
+    let ty = binder.generated_ty;
+    if k == 0 || !work.expressions.get(ty, work.budget)?.has_free() {
+        return Ok(ty);
+    }
+    Ok(work.expressions.bind(
+        ty,
+        0,
+        positions.suffix(n - k)?,
+        work.levels,
+        work.names,
+        work.budget,
+    )?)
+}
+
 fn application_binders(
     work: &mut Working<'_>,
     mut f: ExprId,
@@ -264,12 +281,36 @@ impl Scratch {
         leave?;
         Ok(())
     }
+    pub(super) fn single_family(
+        &mut self,
+        work: &mut Working<'_>,
+        request: &Request<'_>,
+        scope: Scope<'_>,
+        environment: &Environment,
+    ) -> Result<(), Stop> {
+        if request.types.len() != 1 {
+            return Err(ResourceError::Invariant.into());
+        }
+        self.family_telescope(work, request, scope, environment, true)
+    }
+
     pub(super) fn family<T: Templates>(
         &mut self,
         work: &mut Working<'_>,
         request: &T,
         scope: Scope<'_>,
         environment: &Environment,
+    ) -> Result<(), Stop> {
+        self.family_telescope(work, request, scope, environment, false)
+    }
+
+    fn family_telescope<T: Templates>(
+        &mut self,
+        work: &mut Working<'_>,
+        request: &T,
+        scope: Scope<'_>,
+        environment: &Environment,
+        single_root: bool,
     ) -> Result<(), Stop> {
         self.family_set.fill(work, request.family_names())?;
         let first = request.family(0)?;
@@ -306,11 +347,18 @@ impl Scratch {
             };
             let result;
             loop {
-                let head = work.expose_checked(current, path, scope, environment)?;
+                let exposed = work.expose_checked(current, path, scope, environment);
+                let head = exposed?;
                 path = head.path;
                 match kind(work, head.expression)? {
                     ExprKind::Pi(_, domain, body, _) => {
-                        path = work.check_type(domain, false, path, scope, environment)?;
+                        // The checked single root reduces to this Pi. Its domain
+                        // is formed. Opening its body with the fresh local of
+                        // that exact domain preserves formation for the next
+                        // iteration. Keep the path of the actual head exposure.
+                        if !single_root {
+                            path = work.check_type(domain, false, path, scope, environment)?;
+                        }
                         let generated_ty = generated_domain(work, environment, domain)?;
                         let local = if member != 0 && position < self.parameters {
                             let common = self.binders[position];
@@ -823,7 +871,52 @@ impl Scratch {
         lambda: bool,
     ) -> Result<ExprId, Stop> {
         let fields = self.fields(index)?;
-        close_by(work, body, fields.len(), |k| fields[k].binder, lambda)
+        close_by(work, body, fields.len(), |k| fields[k].binder, lambda, &[])
+    }
+    // One expanded block, with an immutable scratch telescope and one syntax arena.
+    // Outer domain k depends only on the first k outer binder IDs. Later fields
+    // do not enter its abstraction even when they occur in the generated body.
+    pub(super) fn with_rule_domains<R>(
+        &self,
+        work: &mut Working<'_>,
+        run: impl FnOnce(&mut Working<'_>, &RuleDomains<'_>) -> Result<R, Stop>,
+    ) -> Result<R, Stop> {
+        let mut domains = Vec::new();
+        let mut ids = Vec::new();
+        let prepared = (|| -> Result<(), Stop> {
+            let outer = self.binders[..self.parameters]
+                .iter()
+                .chain(&self.binders[self.parameters + self.indices..]);
+            if !self.constructors.is_empty() {
+                let n = self.binders.len() - self.indices;
+                work.budget.grow_vec(&mut ids, n)?;
+                ids.extend(outer.clone().rev().map(|b| b.id.slot()));
+                let positions = Abstraction::new(&ids, work.budget)?;
+                work.budget.grow_vec(&mut domains, n)?;
+                for (k, binder) in outer.enumerate() {
+                    domains.push(close_domain(work, *binder, &positions, n, k)?);
+                }
+            }
+            Ok(())
+        })();
+        let id_bytes = ids.capacity() as u64 * 4;
+        drop(ids);
+        let retired = work.budget.release(id_bytes);
+        let result = (|| {
+            retired?;
+            prepared?;
+            run(
+                work,
+                &RuleDomains {
+                    scratch: self,
+                    domains: &domains,
+                },
+            )
+        })();
+        let domain_bytes = domains.capacity() as u64 * 4;
+        drop(domains);
+        work.budget.release(domain_bytes)?;
+        result
     }
     /// Closes `body` over the parameters, then the motives and minors, then
     /// `inner(0..m)`, in one `close_by` pass.
@@ -834,6 +927,7 @@ impl Scratch {
         m: usize,
         inner: impl Fn(usize) -> Binder,
         lambda: bool,
+        shared: &[ExprId],
     ) -> Result<ExprId, Stop> {
         let p = self.parameters;
         let base = p + self.indices;
@@ -847,7 +941,7 @@ impl Scratch {
                 inner(k - outer)
             }
         };
-        close_by(work, body, outer + m, binder, lambda)
+        close_by(work, body, outer + m, binder, lambda, shared)
     }
     fn family_application(&self, work: &mut Working<'_>, name: NameId) -> Result<ExprId, Stop> {
         let member = self
@@ -976,13 +1070,22 @@ impl Scratch {
             work,
             ExprKind::Pi(NameId::ANONYMOUS, ty, result, BinderInfo::Default),
         )?;
-        self.close_rule(work, result, indices.len(), |k| indices[k], false)
+        self.close_rule(work, result, indices.len(), |k| indices[k], false, &[])
     }
     pub(super) fn rhs(
         &self,
         work: &mut Working<'_>,
         recursor: NameId,
         index: usize,
+    ) -> Result<ExprId, Stop> {
+        self.rhs_with_domains(work, recursor, index, &[])
+    }
+    fn rhs_with_domains(
+        &self,
+        work: &mut Working<'_>,
+        recursor: NameId,
+        index: usize,
+        domains: &[ExprId],
     ) -> Result<ExprId, Stop> {
         let member = self.constructor_member(index)?;
         if !same(
@@ -1049,11 +1152,23 @@ impl Scratch {
             result?;
         }
         let fields = self.fields(index)?;
-        self.close_rule(work, body, fields.len(), |k| fields[k].binder, true)
+        self.close_rule(
+            work,
+            body,
+            fields.len(),
+            |k| fields[k].binder,
+            true,
+            domains,
+        )
     }
     /// Closed type of an owned generated rule; checked independently before
     /// restoration, then restored alongside its RHS for public rechecking.
-    pub(super) fn rule_type(&self, work: &mut Working<'_>, index: usize) -> Result<ExprId, Stop> {
+    fn rule_type(
+        &self,
+        work: &mut Working<'_>,
+        index: usize,
+        domains: &[ExprId],
+    ) -> Result<ExprId, Stop> {
         let base = self.parameters + self.indices;
         let member = self.constructor_member(index)?;
         let result = apply(
@@ -1063,7 +1178,14 @@ impl Scratch {
         )?;
         let result = append(work, ExprKind::App(result, self.constructors[index]))?;
         let fields = self.fields(index)?;
-        self.close_rule(work, result, fields.len(), |k| fields[k].binder, false)
+        self.close_rule(
+            work,
+            result,
+            fields.len(),
+            |k| fields[k].binder,
+            false,
+            domains,
+        )
     }
     pub(super) fn recheck(
         &self,
@@ -1099,6 +1221,25 @@ impl Scratch {
             return Err(ResourceError::Invariant.into());
         }
         Ok(())
+    }
+}
+
+pub(super) struct RuleDomains<'a> {
+    scratch: &'a Scratch,
+    domains: &'a [ExprId],
+}
+impl RuleDomains<'_> {
+    pub(super) fn rhs(
+        &self,
+        work: &mut Working<'_>,
+        recursor: NameId,
+        index: usize,
+    ) -> Result<ExprId, Stop> {
+        self.scratch
+            .rhs_with_domains(work, recursor, index, self.domains)
+    }
+    pub(super) fn rule_type(&self, work: &mut Working<'_>, index: usize) -> Result<ExprId, Stop> {
+        self.scratch.rule_type(work, index, self.domains)
     }
 }
 

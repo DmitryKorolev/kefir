@@ -515,10 +515,30 @@ enum Lazy {
 
 #[derive(Clone, Copy)]
 struct LInst {
-    ci: u32,
+    owner: InstanceOwner,
     start: u32,
-    len: u32,
     next: u32,
+}
+
+/// A short mapping names its formals directly, so using a retained substitution
+/// never requires reloading the first constant that happened to use it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InstanceOwner {
+    Declared { ci: u32, arity: u32 },
+    Singleton(NameId),
+    Pair([NameId; 2]),
+    Committed(super::Span),
+}
+
+impl InstanceOwner {
+    fn arity(self) -> u32 {
+        match self {
+            Self::Declared { arity, .. } => arity,
+            Self::Singleton(_) => 1,
+            Self::Pair(_) => 2,
+            Self::Committed(span) => span.len,
+        }
+    }
 }
 
 mod natural_store;
@@ -883,9 +903,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
         });
         room(self.b, &mut self.reserved, &mut self.linsts, 1)?;
         self.linsts.push(LInst {
-            ci: NONE,
+            owner: InstanceOwner::Declared { ci: NONE, arity: 0 },
             start: 0,
-            len: 0,
             next: NONE,
         });
         Ok(())
@@ -1453,7 +1472,7 @@ mod read_wide;
 crate::resource::charged::charged! {
     ConstantSlot => 12,
     NatLit => 24,
-    LInst => 16,
+    LInst => 20,
     ((u32, u32, u32, [u32; 8], [u32; 8]), (u32, [u32; 8])) => 112,
     ((u32, u32, u32, u32), u32) => 20,
     ((u32, [u32; 8], [u32; 8]), u32) => 72,

@@ -137,7 +137,7 @@ const _: () = assert!(size_of::<Formation>() == 8);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<Option<Stage>>() == 24);
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 struct Span {
     offset: u32,
     len: u32,

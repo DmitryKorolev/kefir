@@ -82,8 +82,8 @@ answers mean, and how it computes.
   the form "if these arguments are these constructors, the call is this field,
   this argument or this recursive call", and applies them instead of unfolding
   while they match. Nothing is keyed by name.
-- **Work carries over between declarations, within 16 MiB.** Lean's kernel
-  starts each declaration with empty caches. kefir keeps up to 16 MiB of
+- **Work carries over between declarations, within 20 MiB.** Lean's kernel
+  starts each declaration with empty caches. kefir keeps up to 20 MiB of
   evaluator state from one declaration to the next, and recognizes a theorem
   whose statement and proof repeat one already checked.
 - **Caches are small and forgetful.** Most caches are fixed-size tables of at
@@ -91,8 +91,9 @@ answers mean, and how it computes.
   where kefir must remember exactly. Every cache states which results it holds
   and where they remain valid.
 - **Input streams through.** Each declaration is checked as soon as its record
-  is read, and the storage for its own terms is released once it is checked,
-  so the export is never held in memory whole.
+  is read, and the working storage for checking it is released afterwards.
+  The export's text is never held whole; each decoded expression is kept as
+  one compact 20-byte row for the rest of the run.
 
 ## Build and run
 

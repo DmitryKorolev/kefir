@@ -17,6 +17,25 @@ impl<'e, 'w> Kernel<'e, 'w> {
             }
         }
     }
+    /// PARAM covers every level in every descendant, including constant
+    /// arguments and binder domains. If it is clear, substituting the
+    /// incoming instance acts as the identity throughout this source.
+    /// Values read from bound slots retain their own instances. Limit reuse
+    /// to ordinary evaluation without external free-local interpretation.
+    #[inline]
+    fn evaluation_instance(&self, node: Expression<'w>, li: u32) -> u32 {
+        if li != 0
+            && !node.has_param()
+            && !node.has_free()
+            && self.formation.is_none()
+            && self.checked_context.is_none()
+        {
+            0
+        } else {
+            li
+        }
+    }
+
     /// A lazily evaluated argument; cheap forms are evaluated directly.
     #[inline(always)]
     pub(super) fn thunk(&mut self, e: ExprId, env: u32, li: u32) -> R<u32> {
@@ -51,6 +70,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 _ => {}
             }
         }
+        let li = self.evaluation_instance(node, li);
         let loose = node.loose_range();
         let exact = self.source_memo_key(e, node, env, loose, li);
         let (_, _, kt, k1, k2) = exact;
@@ -97,6 +117,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
         node: Expression<'w>,
         kind: ExprKind<'w>,
     ) -> R<u32> {
+        let li = self.evaluation_instance(node, li);
         let loose = node.loose_range();
         // Variables and closures need neither the memo nor a decode later.
         match kind {

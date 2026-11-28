@@ -21,6 +21,7 @@ pub(crate) enum Binding<'a> {
         lookup: &'a dyn Fn(u32, &mut Budget) -> Result<u32, ResourceError>,
     },
     Abstract(&'a [u32]),
+    AbstractDescending(DescendingIds<'a>),
     #[allow(
         dead_code,
         reason = "Retained for component regressions and explicit internal inspection"
@@ -31,6 +32,43 @@ pub(crate) enum Binding<'a> {
         reason = "Retained for component regressions and explicit internal inspection"
     )]
     Lower(u32),
+}
+
+/// The private slice is strictly descending and has at most u32::MAX entries.
+#[derive(Clone, Copy)]
+pub(crate) struct DescendingIds<'a>(&'a [u32]);
+
+/// Checked order for this immutable telescope only. Suffix positions start at
+/// zero independently for each binding operation.
+pub(crate) struct Abstraction<'a> {
+    ids: &'a [u32],
+    descending: bool,
+}
+
+impl<'a> Abstraction<'a> {
+    pub(crate) fn new(ids: &'a [u32], b: &mut Budget) -> Result<Self, ExpressionError> {
+        let len = u32::try_from(ids.len()).map_err(|_| ExpressionError::NumericRange)?;
+        b.charge_work(u64::from(len))?;
+        Ok(Self {
+            ids,
+            descending: ids.windows(2).all(|p| p[0] > p[1]),
+        })
+    }
+
+    pub(crate) fn suffix(&self, start: usize) -> Result<Binding<'a>, ResourceError> {
+        let ids = self.ids.get(start..).ok_or(ResourceError::Invariant)?;
+        Ok(if self.descending {
+            Binding::AbstractDescending(DescendingIds(ids))
+        } else {
+            Binding::Abstract(ids)
+        })
+    }
+}
+
+impl Binding<'_> {
+    fn is_abstraction(self) -> bool {
+        matches!(self, Self::Abstract(_) | Self::AbstractDescending(_))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -339,7 +377,7 @@ impl Expressions {
                 Frame::Visit(id, offset) => {
                     let node = self.get(id, b)?;
                     let skip = match op {
-                        Binding::Abstract(_) => !node.has_free(),
+                        Binding::Abstract(_) | Binding::AbstractDescending(_) => !node.has_free(),
                         _ => node.loose_range() <= offset,
                     };
                     if skip {
@@ -353,7 +391,7 @@ impl Expressions {
                     // Depth bounds all descendant binder increments: do not
                     // bypass NumericRange at an overflowing caller offset.
                     if CACHED
-                        && matches!(op, Binding::Abstract(_))
+                        && op.is_abstraction()
                         && offset != 0
                         && offset <= u32::MAX - node.depth()
                         && s.memo.get(id.0, 0, b)? == Some(id.0)
@@ -408,18 +446,26 @@ impl Expressions {
                                 self.append(ExprKind::Bound(next), levels, names, b)?
                             })
                         }
-                        ExprKind::Free(f) => Some(if matches!(op, Binding::Abstract(_)) {
-                            if let Some(index) = s.variables.get(f, 0, b)? {
+                        ExprKind::Free(f) => {
+                            let position = match op {
+                                Binding::Abstract(_) => s.variables.get(f, 0, b)?,
+                                Binding::AbstractDescending(DescendingIds(ids)) => {
+                                    b.charge_work(
+                                        u64::from(ids.len().checked_ilog2().unwrap_or(0)) + 2,
+                                    )?;
+                                    ids.binary_search_by(|id| f.cmp(id)).ok().map(|i| i as u32)
+                                }
+                                _ => None,
+                            };
+                            Some(if let Some(index) = position {
                                 let index = offset
                                     .checked_add(index)
                                     .ok_or(ExpressionError::NumericRange)?;
                                 self.append(ExprKind::Bound(index), levels, names, b)?
                             } else {
                                 id
-                            }
-                        } else {
-                            id
-                        }),
+                            })
+                        }
                         ExprKind::Sort(_)
                         | ExprKind::Constant(..)
                         | ExprKind::Natural(_)
@@ -573,7 +619,7 @@ impl Expressions {
 /// The separate free-ID index never uses this result-memo key classification.
 #[inline]
 fn memo_offset(op: Binding<'_>, source: ExprId, result: ExprId, offset: u32) -> u32 {
-    if matches!(op, Binding::Abstract(_)) && source == result {
+    if op.is_abstraction() && source == result {
         0
     } else {
         offset

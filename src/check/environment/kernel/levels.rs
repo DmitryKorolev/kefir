@@ -4,21 +4,61 @@ use super::*;
 
 impl<'e, 'w> Kernel<'e, 'w> {
     pub(super) fn subst_level(&mut self, l: LevelId, li: u32) -> R<LevelId> {
-        if li == 0 || !self.levels.get(l, self.b)?.has_param() {
+        if li == 0 {
+            return Ok(l);
+        }
+        let node = self.levels.get(l, self.b)?;
+        if !node.has_param() {
             return Ok(l);
         }
         if let Some(&r) = self.level_subst.get(&(l.slot(), li)) {
             return Ok(r);
         }
         let inst = self.linsts[li as usize];
-        let params = self.const_view(inst.ci)?.params;
+        let params: &[NameId] = match &inst.owner {
+            InstanceOwner::Declared { ci, .. } => self.const_view(*ci)?.params,
+            InstanceOwner::Singleton(formal) => std::slice::from_ref(formal),
+            InstanceOwner::Pair(formals) => formals,
+            InstanceOwner::Committed(span) => super::super::view(&self.env.names, *span)?,
+        };
         // The instance store is immutable during substitution. Borrow this
         // disjoint field rather than copying an unbounded replacement list.
-        let args = &self.linst_levels[inst.start as usize..(inst.start + inst.len) as usize];
+        let args =
+            &self.linst_levels[inst.start as usize..(inst.start + inst.owner.arity()) as usize];
         let names = self.names;
-        let r =
+        let r = if params.len() <= 4
+            && let LevelKind::Param(name) = node.kind()
+        {
+            // The source leaf is already decoded. Replacements can be newer
+            // than the source frontier, but must exist in this same level store.
+            let n = params.len() as u64;
+            self.b.charge_work(4 + n + n * n.saturating_sub(1) / 2)?;
+            if self.subst_end > self.levels.len()
+                || l.slot() as usize >= self.subst_end
+                || params.len() != args.len()
+            {
+                return Err(ResourceError::Invariant.into());
+            }
+            let target = names.summary(name, self.b)?.canonical;
+            let mut seen = [0; 4];
+            let mut result = None;
+            for (i, (&formal, &actual)) in params.iter().zip(args).enumerate() {
+                let key = names.summary(formal, self.b)?.canonical;
+                self.levels.get(actual, self.b)?;
+                if seen[..i].contains(&key) {
+                    return Err(ResourceError::Invariant.into());
+                }
+                seen[i] = key;
+                if key == target {
+                    result = Some(actual);
+                }
+            }
+            self.b.observe(crate::resource::Event::MachineSteps, 1);
+            result.ok_or(ResourceError::Invariant)?
+        } else {
             self.levels
-                .with_substitution(names, self.subst_end, params, args, self.b, |s| s.apply(l))?;
+                .with_substitution(names, self.subst_end, params, args, self.b, |s| s.apply(l))?
+        };
         map_put(
             self.b,
             &mut self.reserved,
@@ -92,7 +132,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
     }
     pub(super) fn li_levels(&self, li: u32) -> &[LevelId] {
         let inst = self.linsts[li as usize];
-        &self.linst_levels[inst.start as usize..(inst.start + inst.len) as usize]
+        &self.linst_levels[inst.start as usize..(inst.start + inst.owner.arity()) as usize]
     }
     /// Cold overflow for the existing typed universe substitution. Both callers
     /// validate exact arity first. No instance is published until every level
@@ -139,11 +179,15 @@ impl<'e, 'w> Kernel<'e, 'w> {
     /// lists use bounded stack workspace; long lists retire their charged
     /// buffer here, before callers recurse through constructor/projection types.
     pub(super) fn rebind_instance(&mut self, ci: u32, li: u32) -> R<u32> {
-        if li == 0 || self.linsts[li as usize].ci == ci {
+        if li == 0 {
+            return Ok(li);
+        }
+        let old = self.linsts[li as usize].owner;
+        if self.same_instance_owner(old, self.instance_owner(ci, old.arity())?)? {
             return Ok(li);
         }
         let inst = self.linsts[li as usize];
-        let (start, len) = (inst.start as usize, inst.len as usize);
+        let (start, len) = (inst.start as usize, inst.owner.arity() as usize);
         if len <= LEVEL_ARGS {
             let mut buffer = [LevelId::ZERO; LEVEL_ARGS];
             buffer[..len].copy_from_slice(&self.linst_levels[start..start + len]);
@@ -163,13 +207,92 @@ impl<'e, 'w> Kernel<'e, 'w> {
         })();
         self.finish_level_buffer(result, buffer, reserved)
     }
+    /// Read only an already loaded signature in the current epoch. A stable
+    /// graph slot does not by itself identify an entry in the current views.
+    fn instance_owner(&self, ci: u32, arity: u32) -> R<InstanceOwner> {
+        if (1..=4).contains(&arity) {
+            let at = if self.constant_epoch == 1 {
+                Some(ci)
+            } else {
+                self.constant_slots
+                    .get(ci as usize)
+                    .filter(|slot| slot.epoch == self.constant_epoch)
+                    .map(|slot| slot.view)
+            };
+            if let Some(info) = at.and_then(|i| self.consts.get(i as usize)) {
+                match (arity, info.params) {
+                    (1, [formal]) => return Ok(InstanceOwner::Singleton(*formal)),
+                    (2, [a, b]) => return Ok(InstanceOwner::Pair([*a, *b])),
+                    (3 | 4, names) if names.len() == arity as usize => {
+                        if let Some(span) = self.committed_formal_span(info)? {
+                            return Ok(InstanceOwner::Committed(span));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(InstanceOwner::Declared { ci, arity })
+    }
+
+    // The borrowed view has already passed visibility and safety checks. Only
+    // its own committed parameter slice can supply a stable span. Names
+    // outside the committed prefix may be reused after a staged rollback.
+    fn committed_formal_span(&self, info: &CInfo<'_>) -> R<Option<super::super::Span>> {
+        let Some(slot) = self
+            .env
+            .by_name
+            .get(info.canon as usize)
+            .and_then(|v| v.checked_sub(1))
+        else {
+            return Ok(None);
+        };
+        let index = slot as usize;
+        if index >= self.before || index >= self.env.len() {
+            return Ok(None);
+        }
+        let span = self
+            .env
+            .entries
+            .get(index)
+            .ok_or(ResourceError::Invariant)?
+            .parameters;
+        let names = super::super::view(&self.env.names, span)?;
+        Ok(std::ptr::eq(names, info.params).then_some(span))
+    }
+
+    fn same_instance_owner(&self, a: InstanceOwner, b: InstanceOwner) -> R<bool> {
+        if a == b {
+            return Ok(true);
+        }
+        if let (InstanceOwner::Committed(a), InstanceOwner::Committed(b)) = (a, b) {
+            let names = &self.env.names;
+            return Ok(super::super::view(names, a)? == super::super::view(names, b)?);
+        }
+        Ok(false)
+    }
+
     pub(super) fn intern_li(&mut self, ci: u32, levels: &[LevelId]) -> R<u32> {
         if levels.is_empty() {
             return Ok(0);
         }
         use std::hash::Hasher;
         let mut h = FastHasher::new();
-        h.write_u32(ci);
+        let arity = u32::try_from(levels.len()).map_err(|_| ResourceError::Counter)?;
+        let owner = self.instance_owner(ci, arity)?;
+        match owner {
+            InstanceOwner::Declared { ci, .. } => h.write_u32(ci),
+            InstanceOwner::Singleton(formal) => h.write_u32(formal.0),
+            InstanceOwner::Pair([a, b]) => {
+                h.write_u32(a.0);
+                h.write_u32(b.0);
+            }
+            InstanceOwner::Committed(span) => {
+                for name in super::super::view(&self.env.names, span)? {
+                    h.write_u32(name.0);
+                }
+            }
+        }
         for l in levels {
             h.write_u32(l.slot());
         }
@@ -184,7 +307,7 @@ impl<'e, 'w> Kernel<'e, 'w> {
                 self.steps_by(levels.len() as u64)?;
             }
             let inst = self.linsts[cur as usize];
-            if inst.ci == ci && self.li_levels(cur) == levels {
+            if self.same_instance_owner(inst.owner, owner)? && self.li_levels(cur) == levels {
                 return Ok(cur);
             }
             cur = inst.next;
@@ -200,9 +323,8 @@ impl<'e, 'w> Kernel<'e, 'w> {
         room(self.b, &mut self.reserved, &mut self.linsts, 1)?;
         self.linst_levels.extend_from_slice(levels);
         self.linsts.push(LInst {
-            ci,
+            owner,
             start,
-            len: levels.len() as u32,
             next: head,
         });
         map_put(self.b, &mut self.reserved, &mut self.linst_index, key, id)?;
@@ -214,13 +336,13 @@ impl<'e, 'w> Kernel<'e, 'w> {
             return Ok(true);
         }
         let (la, lc) = (self.linsts[a as usize], self.linsts[c as usize]);
-        if la.len != lc.len {
+        if la.owner.arity() != lc.owner.arity() {
             return Ok(false);
         }
-        if la.len as usize > LEVEL_ARGS {
-            self.steps_by(u64::from(la.len))?;
+        if la.owner.arity() as usize > LEVEL_ARGS {
+            self.steps_by(u64::from(la.owner.arity()))?;
         }
-        for offset in 0..la.len as usize {
+        for offset in 0..la.owner.arity() as usize {
             // Read stable handles before the mutating universe comparison;
             // no owned copies survive that operation.
             let x = self.linst_levels[la.start as usize + offset];

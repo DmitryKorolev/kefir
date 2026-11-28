@@ -704,7 +704,7 @@ impl State {
                     // Pre-staging authority: committed environment only;
                     // the staged pass below re-types the same family.
                     work.with_pre_staging_sorts(|work| {
-                        s.family(work, request, scope(None, parameters), &self.environment)
+                        s.single_family(work, request, scope(None, parameters), &self.environment)
                     })?;
                     let level = work
                         .levels
@@ -759,7 +759,7 @@ impl State {
         let negative = decoder
             .declaration_session(budget, |work| {
                 with_scratch(work, |work, s| {
-                    s.family(
+                    s.single_family(
                         work,
                         request,
                         scope(Some(phase), parameters),

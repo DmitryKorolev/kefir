@@ -1,7 +1,9 @@
 //! Resumable checked inference for ordinary head/comparison demands. One outer
 //! Working failure owner drives the machine; it never recursively calls infer_at.
 use super::*;
+mod application;
 mod memo;
+mod telescope;
 use crate::check::environment::normalization::Head;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,6 +426,19 @@ impl Machine {
                     )?;
                     push(frames, Frame::Visit(opened, incoming), work.budget)?;
                 }
+                Frame::LambdaBody { .. }
+                    if matches!(frames.last(), Some(Frame::LambdaBody { .. })) =>
+                {
+                    let body = pending.take().ok_or(ResourceError::Invariant)?;
+                    *pending = Some(telescope::close(
+                        work,
+                        frame,
+                        frames,
+                        body,
+                        #[cfg(feature = "introspection")]
+                        &mut self.failure_view,
+                    )?);
+                }
                 Frame::PiBody {
                     root,
                     local,
@@ -711,13 +726,18 @@ impl Machine {
                     else {
                         return Err(ResourceError::Invariant.into());
                     };
-                    let ty = work.instantiate_application_result(
+                    *pending = application::finish(
+                        work,
+                        environments,
+                        frames,
                         codomain,
                         root.child(argument),
-                        environments,
+                        path,
+                        #[cfg(feature = "introspection")]
+                        &mut self.failure_view,
                     )?;
-                    *pending = Some(Inferred { ty, path });
                 }
+                Frame::AppSubstitution(_) => return Err(ResourceError::Invariant.into()),
                 Frame::LetType(root, incoming) => {
                     let _inferred = pending.take().ok_or(ResourceError::Invariant)?;
                     let (_, type_path) = observed_sort(

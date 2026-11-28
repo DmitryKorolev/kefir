@@ -16,12 +16,17 @@ fn under_binder(m: Option<Mask>) -> Option<Mask> {
 }
 impl Kernel<'_, '_> {
     pub(super) fn read_plan(&mut self, e: ExprId) -> R<Option<Mask>> {
-        if let Some(&m) = self.read_plans.get(&e.slot()) {
-            return Ok(m);
-        }
         let n = self.exprs.get(e, self.b)?;
+        // Published plain masks and the recursive calculation have the same
+        // binder shifts and unions. Range-only rows cannot take this shortcut.
+        if let Some(bits) = n.plain_binding_mask() {
+            return Ok(Some([u64::from(bits), 0, 0, 0]));
+        }
         if n.loose_range() == 0 {
             return Ok(Some([0; 4]));
+        }
+        if let Some(&m) = self.read_plans.get(&e.slot()) {
+            return Ok(m);
         }
         self.enter()?;
         let result: R<Option<Mask>> = (|| {

@@ -102,6 +102,8 @@ enum Frame {
         domain_path: ReductionPath,
     },
     AppFunction(View, ReductionPath),
+    // Paired immediately below an AppArgument carrying an unmaterialized codomain.
+    AppSubstitution(EnvId),
     AppArgument {
         root: View,
         domain: ExprId,
@@ -160,7 +162,7 @@ impl Frame {
                 expression: root,
                 environment: EnvId::EMPTY,
             }),
-            Self::LetBody { .. } => None,
+            Self::LetBody { .. } | Self::AppSubstitution(_) => None,
         }
     }
 }

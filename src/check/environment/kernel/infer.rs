@@ -617,7 +617,15 @@ impl<'e, 'w> Kernel<'e, 'w> {
                         return no();
                     }
                 }
-                let f = self.proj(xv, j, sci)?;
+                // The constructor telescope takes the preceding field itself.
+                // Its type may never demand the field's normal form.
+                let f = if self.meta[xv as usize].whnf != NONE
+                    || matches!(self.vals[xv as usize], Val::Local { .. })
+                {
+                    self.proj(xv, j, sci)?
+                } else {
+                    self.push(Val::Proj { x: xv, idx: j, sci })?
+                };
                 t = self.instantiate(pw, f)?;
             }
             let pw = self.pi_like(t)?;
